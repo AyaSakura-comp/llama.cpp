@@ -4060,7 +4060,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    // Q4_K/Q5_K with mmq_x=128 use 240-256 VGPRs per wave on RDNA 3.5; Q4_K also spills.
+    // The 64-column tile removes the Q4_K spill and increases occupancy for both hot MoE kernels.
+    const bool rdna35_high_vgpr = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K;
+    const int mmq_x_max = GGML_CUDA_CC_IS_RDNA3_5(cc) && rdna35_high_vgpr ? 64 : get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;
