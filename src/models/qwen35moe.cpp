@@ -240,6 +240,13 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    // MTP consumes every hidden row, but only the final row of this ubatch can
+    // contribute to sampling. Narrow after preserving the full embedding output.
+    if (cparams.mtp_prefill_logits_last && cur->ne[1] > 1) {
+        cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
+        cb(cur, "mtp_logits_last", -1);
+    }
+
     // LM head
     cur = build_lora_mm(model.output, cur);
 

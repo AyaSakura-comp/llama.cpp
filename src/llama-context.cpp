@@ -59,6 +59,7 @@ llama_context::llama_context(
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_pre_norm = false;
+    cparams.mtp_prefill_logits_last = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -781,6 +782,15 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (logits_sparse) {
+        for (int64_t i = (int64_t) n_outputs - 1; i >= 0; --i) {
+            if ((size_t) i < logits_valid.size() && logits_valid[i]) {
+                return logits.data + i*model.vocab.n_tokens();
+            }
+        }
+        return nullptr;
+    }
+
     return logits.data;
 }
 
@@ -822,6 +832,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if (logits_sparse && ((size_t) j >= logits_valid.size() || !logits_valid[j])) {
+            throw std::runtime_error(format("logits were not computed for output row %" PRId64, j));
+        }
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1084,6 +1097,10 @@ void llama_context::set_embeddings_pre_norm(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings_pre_norm = value;
+}
+
+void llama_context::set_mtp_prefill_logits_last(bool value) {
+    cparams.mtp_prefill_logits_last = value;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1803,12 +1820,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            const int64_t n_logits_rows = t_logits->ne[1];
+            const bool last_row_only = cparams.mtp_prefill_logits_last && n_logits_rows == 1 && n_outputs > 1;
+            const int64_t dst_row = n_outputs_prev + (last_row_only ? n_outputs - 1 : 0);
+            const int64_t rows_to_copy = last_row_only ? 1 : n_outputs;
+            float * logits_out = logits.data + dst_row*n_vocab;
 
-            if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+            if (rows_to_copy > 0) {
+                GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT(dst_row + rows_to_copy <= n_outputs_all);
+                GGML_ASSERT((dst_row + rows_to_copy)*n_vocab <= (int64_t) logits.size);
+                GGML_ASSERT(rows_to_copy <= n_logits_rows);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, rows_to_copy*n_vocab*sizeof(float));
+                if (cparams.mtp_prefill_logits_last) {
+                    std::fill(logits_valid.begin() + dst_row, logits_valid.begin() + dst_row + rows_to_copy, 1);
+                }
             }
         }
 
@@ -1904,6 +1930,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+    logits_sparse = cparams.mtp_prefill_logits_last;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2002,6 +2029,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         // init, never resized afterwards
         output_ids.resize(n_batch);
     }
+    logits_valid.resize(n_outputs_max);
+    std::fill(logits_valid.begin(), logits_valid.end(), 0);
+    logits_sparse = false;
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
@@ -2109,6 +2139,9 @@ void llama_context::output_reorder() {
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+            }
+            if (i0 < logits_valid.size() && i1 < logits_valid.size()) {
+                std::swap(logits_valid[i0], logits_valid[i1]);
             }
         }
 
@@ -3536,6 +3569,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_pre_norm(llama_context * ctx, bool value) {
     ctx->set_embeddings_pre_norm(value);
+}
+
+void llama_set_mtp_prefill_logits_last(llama_context * ctx, bool value) {
+    ctx->set_mtp_prefill_logits_last(value);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

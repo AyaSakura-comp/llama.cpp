@@ -111,6 +111,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value);
+    void set_mtp_prefill_logits_last(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -316,6 +317,8 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    std::vector<uint8_t> logits_valid; // valid rows when an internal graph emits sparse logits
+    bool logits_sparse = false;
 
     struct swap_info {
         uint32_t i0;

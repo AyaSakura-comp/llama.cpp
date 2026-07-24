@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -244,10 +245,9 @@ struct server_slot {
 
     bool is_mtp() const { return is_mtp_enabled; }
 
-    // The trunk needs to emit logits at every prefill position when either:
-    //  - the task asked for embeddings, or
-    //  - MTP is enabled for this slot (the streaming hook in process() reads
-    //    h_pre_norm at every prompt position).
+    // MTP keeps every prompt row as an output so recurrent batching and the
+    // pre-norm hidden-state stream remain identical to the established path.
+    // The Qwen graph independently narrows the LM head to its final row.
     bool need_embd() const {
         GGML_ASSERT(task);
         return task->need_embd() || is_mtp();
@@ -2762,9 +2762,8 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // Embedding requests and MTP require all hidden rows. The
+                        // MTP graph narrows only the LM head, after h_pre_norm.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
@@ -2904,6 +2903,24 @@ private:
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+
+            bool mtp_prefill_only = slot_batched && slot_batched->is_mtp();
+            llama_seq_id mtp_prefill_seq = -1;
+            for (int32_t k = i; mtp_prefill_only && k < i + n_tokens; ++k) {
+                const llama_seq_id seq_id = batch.seq_id[k][0];
+                auto it = std::find_if(slots.begin(), slots.end(), [seq_id](const server_slot & slot) {
+                    return slot.id == seq_id;
+                });
+                if (mtp_prefill_seq < 0) {
+                    mtp_prefill_seq = seq_id;
+                }
+                mtp_prefill_only =
+                    batch.n_seq_id[k] == 1 &&
+                    seq_id == mtp_prefill_seq &&
+                    it != slots.end() && it->task &&
+                    batch.pos[k] < it->task->n_tokens();
+            }
+            llama_set_mtp_prefill_logits_last(ctx_tgt, mtp_prefill_only);
 
             llama_batch batch_view = {
                 n_tokens,

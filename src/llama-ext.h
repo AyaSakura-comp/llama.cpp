@@ -97,6 +97,9 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value);
 
+// MTP prefill keeps all hidden rows while only the final row needs the LM head.
+LLAMA_API void llama_set_mtp_prefill_logits_last(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);
