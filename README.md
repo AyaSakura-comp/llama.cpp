@@ -1473,4 +1473,124 @@ Commands:
 
 The skill distinguishes llama-server prefill/decode timing from Pi wall time, reports both server `N/time` and `(N-1)/time`, rejects multi-request/tool-follow-up logs, enforces cold server KV through restart, isolates Gemma, waits for stable idle, records MTP acceptance, and verifies production restoration after completion or interruption.
 
+### Qwen 3.6 35B-A3B on gfx1151：Prefill Roofline / Cache Profile
+
+#### Executive summary
+
+目標是將 exact-20K cold prefill 從目前約 **1025–1031 TPS** 提高到 **1500 TPS**。1500 TPS代表20K prompt必須在 **13.333 s**完成；目前unprofiled kernel-trace run為 **19.513 s / 1024.94 TPS**，仍需減少約 **6.18 s（31.7%）**，或增加約 **46.3% TPS**。
+
+目前不是單一的「DRAM bandwidth bound」：
+
+- Q4_K/Q5_K expert MMQ的arithmetic intensity使它們在理論roofline分類上偏memory-side，但實際只使用約47–62 GB/s，遠低於實測GPU copy roof **212.6 GB/s**；真正限制是低occupancy、cache miss造成的latency，以及WMMA/dequant pipeline未充分利用。
+- Q8_0 MMQ屬compute-side，約22.3 TOPS，只有RDNA 3 IU8 WMMA理論peak 59.4 TOPS的37.5%；occupancy僅約15.8%。
+- Flash Attention的L2 hit約82%、MemUnitBusy約22.8%，不是DRAM bandwidth bound，較像compute/latency/register-pressure bound。
+- Gated Delta Net和其concat則是真的memory-unit bound：MemUnitBusy約93.8%與96.6%。
+- MTP sparse-logits仍每個512-token ubatch執行一次LM head，共39次；Q6_K dequant + conversion + GEMM占 **1.255 s / 6.40%**。實際只需要整個prompt最後一列，因此38/39次可消除，是目前最高信心的下一步。
+
+#### Setup
+
+- GPU：Radeon 8060S，gfx1151 / RDNA 3.5，40 CU，最高2.9 GHz
+- RAM：8 × 32-bit LPDDR5X-8000 channels，理論256 GB/s
+- ROCm：7.2.2
+- Model：Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+- Server：`2d3f15e [verified] mtp: skip unused Qwen prompt logits`
+- Prompt：exactly 20,000 tokens，`cache_prompt=false`，max output 1
+- Power profile：`performance`
+- Qwen/Gemma production services在isolated profiling時停止，完成後恢復
+
+rocprofiler-sdk 1.1.0的built-in empirical roofline binary會跳過unsupported `gfx1151`，所以本報告使用：
+
+1. rocprofv3 kernel trace取得未加counter時的kernel占比。
+2. rocprofv3逐一counter收集，避免gfx1151硬體無法同時收集跨block counters。
+3. 自製1 GiB HIP vector-copy kernel測量實際memory roof。
+4. GGUF tensor dimensions計算algorithmic operations。
+5. AMD GPUOpen RDNA 3 WMMA官方數值：IU8 = 512 ops/clock/CU。
+
+Counter collection將整體prefill降至約893 TPS，因此counter runs只用來看每dispatch counter，不作為production throughput數字。
+
+#### Kernel time distribution
+
+Unprofiled exact-20K：`19.513 s / 1024.94 TPS`。GPU kernel總時間19.596 s。
+
+| Graph/kernel class | Time | Share |
+|---|---:|---:|
+| Flash Attention | 3.678 s | 18.77% |
+| Q4_K expert gate/up MMQ | 3.409 s | 17.39% |
+| Q8_0 dense/shared/attention MMQ | 2.607 s | 13.30% |
+| Q5_K expert down MMQ | 2.358 s | 12.03% |
+| Gated Delta Net | 1.290 s | 6.58% |
+| Q6_K output head（dequant + convert + GEMM） | 1.255 s | 6.40% |
+| Dense rocBLAS GEMM | 0.806 s | 4.11% |
+| MoE helpers | 0.796 s | 4.06% |
+| Elementwise ops | 0.782 s | 3.99% |
+| GDN concat | 0.746 s | 3.81% |
+| MMQ activation quantization | 0.510 s | 2.60% |
+| Norm | 0.357 s | 1.82% |
+| Other | 1.003 s | 5.12% |
+
+#### Per-kernel cache/memory/occupancy
+
+| Class | L2 hit | L2 miss | MemUnitBusy | Occupancy | VGPR | FETCH effective GB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Q4_K MMQ | 54.9% | 45.1% | 45.4% | 23.0% | 120 | 62.2 |
+| Q5_K MMQ | 43.6% | 56.4% | 39.3% | 23.4% | 168 | 48.4 |
+| Q8_0 MMQ | 55.6% | 44.4% | 24.2% | 15.8% | 240 | 45.2 |
+| Flash Attention | 82.0% | 18.0% | 22.8% | 35.5% | 240 | 8.5 |
+| Q6_K output head GEMM | 47.4% | 52.6% | 77.0% | 12.4% | 256 | 73.3 |
+| Gated Delta Net | 88.9% | 11.1% | 93.8% | 80.8% | 32 | 23.6 |
+| GDN concat | 74.6% | 25.4% | 96.6% | 83.7% | 16 | 13.6 |
+| Small dense GEMM | 29.0% mean | 71.0% | 39.1% | — | 24 | — |
+
+`FETCH_SIZE`是rocprof派生的video-memory fetch metric；在UMA上應視為logical/external fetch proxy，不能直接等同獨立顯卡HBM counter。相對比較仍有用。
+
+#### Manual roofline
+
+HIP vector-copy五次：212.62 / 212.90 / 212.58 / 212.55 / 212.55 GB/s，約為256 GB/s理論值的83%。使用median約 **212.6 GB/s**作為empirical memory roof。
+
+AMD GPUOpen對RDNA 3列出IU8 WMMA為512 ops/clock/CU。40 CU × 2.9 GHz得到理論 **59.392 TOPS**。
+
+由GGUF dimensions與active 8 experts計算exact-20K algorithmic operations：
+
+| Type | Operations | FETCH | Arithmetic intensity | Achieved | Limiting roof | Roof utilization |
+|---|---:|---:|---:|---:|---:|---:|
+| Q4_K | 27.515 TOP | 191.55 GiB | 133.8 ops/B | 8.07 TOPS | 28.45 TOPS memory roof | 28.4% |
+| Q5_K | 12.751 TOP | 101.37 GiB | 117.1 ops/B | 5.44 TOPS | 24.91 TOPS memory roof | 21.9% |
+| Q8_0 | 57.756 TOP | 107.82 GiB | 498.9 ops/B | 22.29 TOPS | 59.39 TOPS compute roof | 37.5% |
+
+Q4/Q5的roofline位置在memory side，但它們沒有打滿DRAM：實際counter對應bandwidth只有約60/46 GB/s，MemUnitBusy也只有39–45%。因此「cache miss高」是真的，但更精確的診斷是 **low occupancy + miss latency + incomplete WMMA utilization**，而非DRAM channel saturation。
+
+Q8是更明確的compute/occupancy target：高arithmetic intensity、MemUnitBusy只有24%、240 VGPR、occupancy約16%，只達IU8 compute roof的37.5%。
+
+#### New high-confidence optimization
+
+目前sparse-logits是在每個internal ubatch後取最後一row，因此20K prompt仍有：
+
+- 39次vocabulary GEMM：0.851 s
+- 39次Q6_K output dequant：0.247 s
+- 39次FP16 conversion：0.157 s
+- 合計：**1.255 s / 6.40%**
+
+整個request只需要global final prompt row的logits。若保留所有`h_pre_norm` rows，但只在最後一個ubatch建LM head，理論上可省約38/39 × 1.255 = **1.22 s**，估計20K prefill約從19.51 s降到18.29 s，即約 **1093 TPS**。這仍不足1500，但風險低且證據最強。
+
+#### Path toward 1500 TPS
+
+達到1500還需跨多個瓶頸：
+
+1. **Global-final LM head**：預估+6–7%，約1090 TPS。
+2. **Q8_0 register/occupancy**：240 VGPR、16% occupancy；重新測試selective tile、launch geometry或split/fused K策略。
+3. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
+4. **GDN + concat fusion**：合計10.4%，兩者MemUnitBusy 94–97%；避免materialized concat或融合state path。
+5. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
+
+即使先移除global-final LM head，仍需再省約4.96 s；等價於其餘hot kernels再縮短約27%。因此1500 TPS是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
+
+#### Evidence
+
+- Kernel trace：`/tmp/qwen-current-kernel-profile-20260725-025043/`
+- Counter matrix：`/tmp/qwen-roofline-counters-20260725-030655/`
+- Counter summary：`/tmp/qwen-roofline-counters-20260725-030655/counter_summary.json`
+- HIP memory roof：`/tmp/qwen-roofline-counters-20260725-030655/hip_stream_copy.txt`
+- Wrapper：`/tmp/run_qwen_counter_profile.sh`
+- AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
+
 <!-- QWEN-GFX1151-INVESTIGATION-END -->
