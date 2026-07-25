@@ -1570,19 +1570,29 @@ Q8是更明確的compute/occupancy target：高arithmetic intensity、MemUnitBus
 - 39次FP16 conversion：0.157 s
 - 合計：**1.255 s / 6.40%**
 
-整個request只需要global final prompt row的logits。若保留所有`h_pre_norm` rows，但只在最後一個ubatch建LM head，理論上可省約38/39 × 1.255 = **1.22 s**，估計20K prefill約從19.51 s降到18.29 s，即約 **1093 TPS**。這仍不足1500，但風險低且證據最強。
+整個request只需要global final prompt row的logits。若保留所有`h_pre_norm` rows，但只在最後一個ubatch建LM head，理論上可省約38/39 × 1.255 = **1.22 s**，估計20K prefill約從19.51 s降到18.29 s，即約 **1093 TPS**。
+
+##### Implemented result (`675d2d6`)
+
+`[verified] mtp: skip non-final Qwen prompt heads`已同時處理target server chunks、target internal ubatches，以及不需要logits的MTP draft prompt propagation。所有`h_pre_norm` rows、recurrent state、decode logits與public final logits仍保留；multi-slot與實際含media的prompt回退完整LM head。
+
+- rocprof：Q6_K full-output dequant由39次降為 **0次**；global-final單列head改走MMQ。
+- Interleaved exact-20K A/B median：`1028.75 → 1102.86 TPS`，**+7.20%**。
+- Prompt time：`19.441 → 18.135 s`，**-6.72%**。
+- Production cold run：`18.13475 s / 1102.86 TPS`，first token `8160`、logprob `-0.01808076538145542`。
+- 256-token decode在A/B中約66 TPS，沒有顯示回歸；MTP acceptance約98.77%。
 
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
 
-1. **Global-final LM head**：預估+6–7%，約1090 TPS。
+1. **Global-final LM head（完成）**：實測+7.20%，production約1103 TPS。
 2. **Q8_0 register/occupancy**：240 VGPR、16% occupancy；重新測試selective tile、launch geometry或split/fused K策略。
 3. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
 4. **GDN + concat fusion**：合計10.4%，兩者MemUnitBusy 94–97%；避免materialized concat或融合state path。
 5. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
 
-即使先移除global-final LM head，仍需再省約4.96 s；等價於其餘hot kernels再縮短約27%。因此1500 TPS是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
+Global-final LM head完成後，從18.135 s到1500 TPS的13.333 s仍需再省約4.80 s（26.5% wall time，或再增加36.0% TPS）。因此1500 TPS仍是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
 
 #### Evidence
 
@@ -1590,6 +1600,11 @@ Q8是更明確的compute/occupancy target：高arithmetic intensity、MemUnitBus
 - Counter matrix：`/tmp/qwen-roofline-counters-20260725-030655/`
 - Counter summary：`/tmp/qwen-roofline-counters-20260725-030655/counter_summary.json`
 - HIP memory roof：`/tmp/qwen-roofline-counters-20260725-030655/hip_stream_copy.txt`
+- Global-final trace：`/tmp/qwen-global-final-trace-final2-20260725-112433/`
+- Interleaved A/B：`/tmp/qwen-global-final-ab-20260725-110648/summary.json`
+- Production cold run：`/tmp/qwen-global-final-production-20260725-113041/`
+- Multi-slot：`/tmp/qwen-global-final-two-slot-20260725-111248/`
+- Multimodal fallback：`/tmp/qwen-global-final-multimodal-final-20260725-112726/`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 
