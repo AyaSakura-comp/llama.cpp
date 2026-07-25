@@ -1631,7 +1631,7 @@ Q8_0的GL2C miss rate由 **52.18%降至32.71%**，miss events減少47.3%；Q4_K/
 
 已提交為`[verified] hip: reorder gfx1151 MMQ traversal`；尚未deployment。
 
-##### gfx1151 MoE Gate/Up shared preprocessing（candidate）
+##### gfx1151 MoE Gate/Up shared preprocessing（verified）
 
 CUDA graph executor原本能辨識`MUL_MAT_ID Gate + MUL_MAT_ID Up + SwiGLU`，但prefill MMQ不使用既有的single-token MMVQ fusion，因此Gate與Up會對相同activation與routing各自重做expert-ID compaction及Q8_1 activation quantization。Candidate在gfx1151、Q4_K、large-prefill、SwiGLU且backend確實選擇MMQ時，共用一次routing preprocessing與activation quantization，再依序執行原本兩個MMQ和SwiGLU；decode、其他GPU/type/op與fallback均不變。
 
@@ -1656,7 +1656,28 @@ Exact-20K trace：
 - Real Pi Agent 28,377-token prompt完成1,437-token merge-sort回答；抽取程式實際執行顯示`All tests passed`。Prefill為**1079.84 TPS**。
 - Independent Codex review：PASS，無blocking correctness或alias/lifetime finding。
 
-此candidate尚未commit或deployment。
+已提交為`ebcf34c [verified] hip: share gfx1151 MoE preprocessing`；尚未deployment。
+
+##### gfx1151 paired Q4 MMQ → SwiGLU Q8_1 epilogue（candidate）
+
+在shared preprocessing之上，gfx1151 Q4_K prefill path以單一workgroup依序計算Gate與Up：Gate accumulator先存入額外LDS，重用同一組register計算Up，再於MMQ epilogue執行SwiGLU與DS4 Q8_1 requantization，直接交給Q5_K Down。Gate、Up與SwiGLU皆不再materialize為global F32；只有Down routing reduction後的hidden state維持F32。Decode、non-MMQ、split/non-local buffer、其他GPU/type與stream-K保留原fallback。
+
+Exact-20K trace相對`ebcf34c`：
+
+- Q4_K dispatch：`3280 → 1760`，其中1520次為paired Gate+Up specialization。
+- Q4_K time：`3.19176 → 3.17465 s`，即使epilogue增加SwiGLU/quantization仍略降。
+- Routing helper：`3280 → 1760`。
+- Standalone gated unary：`4810 → 3290`，`0.18159 → 0.07221 s`。
+- GPU kernel total：`16.49712 → 16.30904 s`（`-1.14%`）。
+- Paired specialization：128 VGPR、128 SGPR、0 scratch；普通Q4 specialization維持120 VGPR。
+
+相同ROCm 7.2.2 toolchain的5+5 interleaved exact-20K/256-token A/B：
+
+- `ebcf34c` median：**1200.98 TPS / 16.65304 s**。
+- Paired MMQ epilogue：**1219.27 TPS / 16.40320 s**。
+- Prefill：**+1.52% TPS / -1.50% time**。
+
+驗證：11950/11950 ROCm backend operations、Qwen35MoE NMSE `9.40e-14`、exact-20K + 63 returned tokens bit-identical（maximum delta `0.0`）、`-np 2` concurrent 20K+7K requests、real Pi Agent 28,377-token merge-sort E2E（generated assertions pass）、trace guards與三輪independent Codex review均通過。
 
 #### Path toward 1500 TPS
 
@@ -1707,6 +1728,12 @@ SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.1
 - MoE shared-preprocessing numeric：`/tmp/qwen-moe-shared-preprocess-numeric-20260725-211334/comparison.json`
 - MoE shared-preprocessing two-slot：`/tmp/qwen-moe-shared-preprocess-two-slot-20260725-211700/validation.json`
 - MoE shared-preprocessing Pi Agent：`/tmp/qwen-moe-shared-preprocess-pi-e2e-20260725-211746/`
+- Paired Q4 MMQ Q8_1 final trace：`/tmp/qwen-moe-mmq-pair-q8-final-trace-20260726-005519/`
+- Paired Q4 MMQ Q8_1 5+5 A/B：`/tmp/qwen-moe-mmq-pair-q8-ab5-20260726-002202/summary.json`
+- Paired Q4 MMQ Q8_1 final numeric：`/tmp/qwen-moe-mmq-pair-q8-final-numeric-20260726-005846/comparison.json`
+- Paired Q4 MMQ Q8_1 multi-slot：`/tmp/qwen-moe-mmq-pair-q8-two-slot-20260726-003350/validation.json`
+- Paired Q4 MMQ Q8_1 Pi Agent：`/tmp/qwen-moe-mmq-pair-q8-pi-e2e-20260726-005106/`
+- Paired Q4 MMQ Q8_1 final review：`/tmp/qwen-moe-mmq-pair-q8-codex-final-review.txt`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 

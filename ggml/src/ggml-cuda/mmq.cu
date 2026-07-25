@@ -295,6 +295,94 @@ void ggml_cuda_mul_mat_q_moe_pair(
     launch(src0_gate, dst_gate);
 }
 
+void ggml_cuda_mul_mat_q_moe_swiglu_down(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_up, const ggml_tensor * src0_gate,
+        const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst_up, ggml_tensor * dst_gate,
+        const ggml_tensor * src0_down, ggml_tensor * dst_down) {
+    GGML_ASSERT(src0_up->type == GGML_TYPE_Q4_K && src0_gate->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(src0_down->type == GGML_TYPE_Q5_K);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst_up->type == GGML_TYPE_F32 && dst_gate->type == GGML_TYPE_F32 && dst_down->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0_up, src0_gate) && ggml_are_same_stride(src0_up, src0_gate));
+    GGML_ASSERT(ggml_are_same_shape(dst_up, dst_gate));
+    GGML_ASSERT(src0_down->ne[0] == src0_up->ne[1] && src0_down->ne[2] == src0_up->ne[2]);
+    GGML_ASSERT(src1->ne[3] == 1 && src1->nb[2] % src1->nb[1] == 0);
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    GGML_ASSERT((cc & 0xffff) == 0x1151);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12*n_expert_used;
+    const int64_t n_experts = src0_up->ne[2];
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_experts + 1);
+    const int si1 = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = src1->nb[2] / src1->nb[1];
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        n_experts, ne12, n_expert_used, ne11, si1, sis1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    const size_t nbytes_src1_q8_1 = ne_get_rows*ne10_padded*sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    quantize_mmq_q8_1_cuda((const float *) src1->data, ids_src1.get(), src1_q8_1.get(), src0_up->type,
+        ne10, src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float),
+        ne10_padded, ne_get_rows, 1, 1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t input_stride_y = ne11*ne10_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
+    const int64_t input_stride_sample = ne12*input_stride_y;
+    const auto q4_args = [&](const ggml_tensor * src0, ggml_tensor * dst) {
+        const int64_t ts0 = ggml_type_size(src0->type);
+        return mmq_args {
+            (const char *) src0->data, src0->type, (const int *) src1_q8_1.ptr,
+            ids_dst.get(), expert_bounds.get(), (float *) dst->data,
+            src0->ne[0], src0->ne[1], ne_get_rows, int64_t(src0->nb[1])/ts0, ne_get_rows, int64_t(dst->nb[1]/sizeof(float)),
+            src0->ne[2], src0->ne[2], int64_t(src0->nb[2])/ts0, input_stride_y, int64_t(dst->nb[2]/sizeof(float)),
+            src0->ne[3], src1->ne[3], int64_t(src0->nb[3])/ts0, input_stride_sample, int64_t(dst->nb[3]/sizeof(float)),
+            false, ne12};
+    };
+
+    const int64_t ne_swiglu = src0_up->ne[1];
+    const int64_t ne_swiglu_padded = GGML_PAD(ne_swiglu, MATRIX_ROW_PADDING);
+    const size_t nbytes_swiglu_q8_1 = ne_get_rows*ne_swiglu_padded*sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> swiglu_q8_1(ctx.pool(), nbytes_swiglu_q8_1);
+
+    // Gate and Up use the same activation tile and are accumulated sequentially in one workgroup.
+    mmq_args up_args = q4_args(src0_up, dst_down);
+    up_args.x_gate = (const char *) src0_gate->data;
+    up_args.dst_swiglu_q8_1 = swiglu_q8_1.ptr;
+    up_args.q8_ncols = ne_get_rows;
+    ggml_cuda_mul_mat_q_switch_type(ctx, up_args, stream);
+
+    const int64_t ts_down = ggml_type_size(src0_down->type);
+    const int64_t down_stride_y = ne_get_rows*ne_swiglu_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
+    const mmq_args down_args = {
+        (const char *) src0_down->data, src0_down->type, (const int *) swiglu_q8_1.ptr,
+        ids_dst.get(), expert_bounds.get(), (float *) dst_down->data,
+        src0_down->ne[0], src0_down->ne[1], ne_get_rows,
+        int64_t(src0_down->nb[1])/ts_down, ne_get_rows, int64_t(dst_down->nb[1]/sizeof(float)),
+        src0_down->ne[2], src0_down->ne[2], int64_t(src0_down->nb[2])/ts_down,
+        down_stride_y, int64_t(dst_down->nb[2]/sizeof(float)),
+        src0_down->ne[3], 1, int64_t(src0_down->nb[3])/ts_down,
+        down_stride_y, int64_t(dst_down->nb[3]/sizeof(float)),
+        false, ne12};
+    ggml_cuda_mul_mat_q_switch_type(ctx, down_args, stream);
+    GGML_UNUSED(dst_up);
+    GGML_UNUSED(dst_gate);
+}
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

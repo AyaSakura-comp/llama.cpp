@@ -20,12 +20,14 @@ def main() -> int:
         print("FAIL: trace contains no Q4_K MMQ dispatches")
         return 1
 
-    # Gate and Up contribute one Q4_K dispatch each. With shared preprocessing,
-    # their pair plus the separate Down path need no more helper launches than
-    # the two Q4_K dispatch streams combined. The unfused graph exceeds this by
-    # roughly one helper launch per Gate/Up pair.
-    if helpers > q4_dispatches:
-        print(f"FAIL: {helpers} routing helpers for {q4_dispatches} Q4_K dispatches; Gate/Up preprocessing is duplicated")
+    # The direct MMQ epilogue represents Gate+Up with one Q4 dispatch. Account
+    # for fallback Gate/Up pairs (two ordinary Q4 dispatches per helper) when
+    # comparing routing-helper and Q4 launch counts.
+    paired = sum("<(ggml_type)12, 32, false, true, true>" in name for name in names)
+    ordinary = q4_dispatches - paired
+    helper_limit = q4_dispatches + ordinary // 2 if paired else q4_dispatches
+    if helpers > helper_limit:
+        print(f"FAIL: {helpers} routing helpers exceed limit {helper_limit} for {q4_dispatches} Q4_K dispatches")
         return 1
 
     print(f"PASS: {helpers} routing helpers for {q4_dispatches} Q4_K dispatches")
