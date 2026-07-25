@@ -60,6 +60,7 @@ llama_context::llama_context(
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_pre_norm = false;
     cparams.mtp_prefill_logits_last = false;
+    cparams.mtp_prefill_logits_skip = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -1103,6 +1104,10 @@ void llama_context::set_mtp_prefill_logits_last(bool value) {
     cparams.mtp_prefill_logits_last = value;
 }
 
+void llama_context::set_mtp_prefill_logits_skip(bool value) {
+    cparams.mtp_prefill_logits_skip = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1231,7 +1236,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+            llm_graph_type   gtype,
+    llama_memory_context_i * mctx,
+               ggml_status & ret,
+                      bool   mtp_prefill_logits_skip) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1243,7 +1253,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    gparams.cparams.mtp_prefill_logits_skip = mtp_prefill_logits_skip;
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1768,7 +1779,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const bool mtp_prefill_logits_skip =
+            cparams.mtp_prefill_logits_skip ||
+            (cparams.mtp_prefill_logits_last && n_outputs_prev + n_outputs < n_outputs_all);
+        const auto * res = process_ubatch(
+            ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, mtp_prefill_logits_skip);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3573,6 +3588,10 @@ void llama_set_embeddings_pre_norm(llama_context * ctx, bool value) {
 
 void llama_set_mtp_prefill_logits_last(llama_context * ctx, bool value) {
     ctx->set_mtp_prefill_logits_last(value);
+}
+
+void llama_set_mtp_prefill_logits_skip(llama_context * ctx, bool value) {
+    ctx->set_mtp_prefill_logits_skip(value);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

@@ -606,7 +606,8 @@ struct llm_graph_params {
             return false;
         }
 
-        if (cparams.mtp_prefill_logits_last != other.cparams.mtp_prefill_logits_last) {
+        if (cparams.mtp_prefill_logits_last != other.cparams.mtp_prefill_logits_last ||
+            cparams.mtp_prefill_logits_skip != other.cparams.mtp_prefill_logits_skip) {
             return false;
         }
 

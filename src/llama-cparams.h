@@ -29,6 +29,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_pre_norm; // also extract the hidden state before the final output norm
     bool mtp_prefill_logits_last; // preserve all hidden rows but project only the final prefill row
+    bool mtp_prefill_logits_skip; // internal: skip the LM head for a non-final MTP prefill ubatch
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

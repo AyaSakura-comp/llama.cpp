@@ -2904,7 +2904,9 @@ private:
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
-            bool mtp_prefill_only = slot_batched && slot_batched->is_mtp();
+            bool mtp_prefill_only =
+                slot_batched && slot_batched->is_mtp() && slot_batched->task && !slot_batched->task->tokens.has_media();
+            bool mtp_prefill_final = false;
             llama_seq_id mtp_prefill_seq = -1;
             for (int32_t k = i; mtp_prefill_only && k < i + n_tokens; ++k) {
                 const llama_seq_id seq_id = batch.seq_id[k][0];
@@ -2919,8 +2921,15 @@ private:
                     seq_id == mtp_prefill_seq &&
                     it != slots.end() && it->task &&
                     batch.pos[k] < it->task->n_tokens();
+                if (mtp_prefill_only) {
+                    mtp_prefill_final |= batch.pos[k] == it->task->n_tokens() - 1;
+                }
             }
             llama_set_mtp_prefill_logits_last(ctx_tgt, mtp_prefill_only);
+            llama_set_mtp_prefill_logits_skip(ctx_tgt, mtp_prefill_only && !mtp_prefill_final);
+            if (ctx_dft) {
+                llama_set_mtp_prefill_logits_skip(ctx_dft.get(), mtp_prefill_only);
+            }
 
             llama_batch batch_view = {
                 n_tokens,

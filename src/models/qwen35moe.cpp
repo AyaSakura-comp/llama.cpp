@@ -240,6 +240,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    if (cparams.mtp_prefill_logits_skip) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     // MTP consumes every hidden row, but only the final row of this ubatch can
     // contribute to sampling. Narrow after preserving the full embedding output.
     if (cparams.mtp_prefill_logits_last && cur->ne[1] > 1) {
@@ -752,6 +757,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     // Pre-norm hidden state: used by the AR draft loop to seed the next MTP step.
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
+
+    if (cparams.mtp_prefill_logits_skip) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm

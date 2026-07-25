@@ -112,6 +112,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value);
     void set_mtp_prefill_logits_last(bool value);
+    void set_mtp_prefill_logits_skip(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -134,7 +135,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   mtp_prefill_logits_skip = false);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);

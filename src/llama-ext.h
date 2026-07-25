@@ -100,6 +100,9 @@ LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool va
 // MTP prefill keeps all hidden rows while only the final row needs the LM head.
 LLAMA_API void llama_set_mtp_prefill_logits_last(struct llama_context * ctx, bool value);
 
+// Skip the LM head for a prompt chunk that does not contain the request's final prompt row.
+LLAMA_API void llama_set_mtp_prefill_logits_skip(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);
