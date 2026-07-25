@@ -1066,13 +1066,13 @@ Interleaved exact-20K、`performance`結果：
 Live deployment：
 
 ```text
-/home/chihmin/llama-mtp-deploy/gfx1151-q4-32-q5-64-mtp-global-final-675d2d6/bin/llama-server
+/home/chihmin/llama-mtp-deploy/gfx1151-q4-32-q5-64-mtp-ssm-fused-30b8617/bin/llama-server
 ```
 
 Rollback drop-in：
 
 ```text
-/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-675d2d6
+/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-30b8617
 ```
 
 ### Qwen 3.6 35B-A3B on gfx1151：UMA Memory Profiling
@@ -1582,17 +1582,32 @@ Q8是更明確的compute/occupancy target：高arithmetic intensity、MemUnitBus
 - Production cold run：`18.13475 s / 1102.86 TPS`，first token `8160`、logprob `-0.01808076538145542`。
 - 256-token decode在A/B中約66 TPS，沒有顯示回歸；MTP acceptance約98.77%。
 
+##### Chunked SSM-conv concat fusion (`30b8617`)
+
+Q8_0實驗確認240 VGPR並不是唯一occupancy限制：128×128 MMQ tile使用57.9 KiB LDS，而gfx1151每CU只有64 KiB，因此最多一個8-wave workgroup。`launch_bounds(..., 4)`沒有降低VGPR；Q8_0 batch-512切到dequant+rocBLAS則回歸至1013.59 TPS，兩者均撤回。
+
+下一個可驗證瓶頸是linear-attention每層將3-row recurrent convolution state與512-row QKV materialize成`CONCAT`，再由SSM convolution讀回。`30b8617`讓CUDA直接從兩個split inputs執行`CONCAT → SSM_CONV → SILU`，並在chunk足夠長時直接由QKV尾端更新recurrent state；短autoregressive chunk保留原路徑。
+
+- Kernel trace：split-input SSM dispatch **1230次**；materialized non-contiguous concat **1290 → 60次**。
+- Interleaved exact-20K median：`1103.28 → 1145.40 TPS`，**+3.82%**。
+- Prompt time：`18.128 → 17.461 s`，**-3.68%**。
+- Production cold run：`17.532 s / 1140.74 TPS`。
+- Exact-20K + 63 generated tokens：token IDs與selected-token logprobs均bit-identical，最大delta `0.0`。
+- Numeric CUDA-vs-CPU fusion tests涵蓋`n_t=1/3/37/64`、`n_s=1/4`、contiguous與transposed/strided state，**16/16通過**；原SSM tests合計**61/61**。
+- 兩slot concurrent 20K/short request、Qwen35/Qwen35MoE architecture tests與independent Codex review均通過。
+
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
 
 1. **Global-final LM head（完成）**：實測+7.20%，production約1103 TPS。
-2. **Q8_0 register/occupancy**：240 VGPR、16% occupancy；重新測試selective tile、launch geometry或split/fused K策略。
-3. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
-4. **GDN + concat fusion**：合計10.4%，兩者MemUnitBusy 94–97%；避免materialized concat或融合state path。
-5. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
+2. **Chunked SSM-conv concat fusion（完成）**：實測再+3.82%，median約1145 TPS。
+3. **Q8_0 compute/LDS**：240 VGPR之外還受57.9/64 KiB LDS限制；launch-bounds與rocBLAS替代均已證實無效，需要重構tile資料流而非單一dispatch knob。
+4. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
+5. **GDN kernel本體**：MemUnitBusy約94%，仍可研究state/output融合；materialized chunked concat已移除。
+6. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
 
-Global-final LM head完成後，從18.135 s到1500 TPS的13.333 s仍需再省約4.80 s（26.5% wall time，或再增加36.0% TPS）。因此1500 TPS仍是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
+SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.13 s（23.6% wall time，或再增加31.0% TPS）。因此1500 TPS仍是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
 
 #### Evidence
 
@@ -1605,6 +1620,11 @@ Global-final LM head完成後，從18.135 s到1500 TPS的13.333 s仍需再省約
 - Production cold run：`/tmp/qwen-global-final-production-20260725-113041/`
 - Multi-slot：`/tmp/qwen-global-final-two-slot-20260725-111248/`
 - Multimodal fallback：`/tmp/qwen-global-final-multimodal-final-20260725-112726/`
+- SSM fusion trace：`/tmp/qwen-fused-ssm-final-trace-20260725-123113/`
+- SSM fusion interleaved A/B：`/tmp/qwen-fused-ssm-ab-20260725-121550/summary.json`
+- SSM fusion numeric comparison：`/tmp/qwen-fused-ssm-numeric-20260725-122044/`
+- SSM fusion multi-slot：`/tmp/qwen-fused-ssm-two-slot-20260725-122241/`
+- Production cold run：`/tmp/qwen-fused-ssm-production-20260725-123508/`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 
