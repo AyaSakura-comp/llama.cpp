@@ -3658,6 +3658,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_CONCAT && ops.begin()[1] == GGML_OP_SSM_CONV
+     && ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * concat   = cgraph->nodes[node_idx];
+        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * silu     = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * weight   = ssm_conv->src[1];
+        return ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && ssm_conv->src[0] == concat &&
+               ggml_get_op_params_i32(concat, 0) == 0 && concat->type == GGML_TYPE_F32 &&
+               weight->type == GGML_TYPE_F32 && weight->nb[0] == sizeof(float) &&
+               ssm_conv->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+               concat->src[0]->ne[0] == weight->ne[0] - 1 && concat->src[1]->ne[0] == ssm_conv->ne[1];
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4188,6 +4204,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        ggml_cuda_op_ssm_conv(*cuda_ctx, cgraph->nodes[i + 1], /*bias_add_node=*/ nullptr,
+                              cgraph->nodes[i + 2], node);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {

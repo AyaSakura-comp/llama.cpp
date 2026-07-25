@@ -430,17 +430,25 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    ggml_tensor * qkv_mixed_untransposed = qkv_mixed;
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    // Update convolution state cache
-    // Extract the last (conv_kernel_size - 1) states from conv_input
-    ggml_tensor * last_conv_states =
-        ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
-                     conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+    // Update convolution state cache. For chunked evaluation, source the trailing rows directly
+    // from qkv_mixed so that conv_input has no consumer besides SSM_CONV and CUDA can fuse its concat.
+    ggml_tensor * last_conv_states;
+    if (n_seq_tokens >= conv_kernel_size - 1) {
+        last_conv_states = ggml_view_3d(ctx0, qkv_mixed_untransposed, conv_channels, conv_kernel_size - 1, n_seqs,
+                                        qkv_mixed_untransposed->nb[1], qkv_mixed_untransposed->nb[2],
+                                        (n_seq_tokens - (conv_kernel_size - 1)) * qkv_mixed_untransposed->nb[1]);
+        last_conv_states = ggml_transpose(ctx0, last_conv_states);
+    } else {
+        last_conv_states = ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
+                                        conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+    }
     cb(last_conv_states, "last_conv_states", il);
 
     ggml_tensor * state_update_target =
@@ -448,7 +456,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
                      kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
     cb(state_update_target, "state_update_target", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    ggml_tensor * conv_state_update = ggml_cpy(ctx0, last_conv_states, state_update_target);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -459,6 +467,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+
+    // Keep CONCAT -> SSM_CONV -> SILU adjacent for CUDA fusion, then persist the recurrent state.
+    ggml_build_forward_expand(gf, conv_output_silu);
+    ggml_build_forward_expand(gf, conv_state_update);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 

@@ -3689,6 +3689,43 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_CONCAT + GGML_OP_SSM_CONV + GGML_OP_UNARY(SILU)
+struct test_ssm_conv_concat_silu : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+    const bool strided_state;
+
+    test_ssm_conv_concat_silu(int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s, bool strided_state)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s), strided_state(strided_state) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CONCAT_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(d_conv, d_inner, n_t, n_s, strided_state);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state;
+        if (strided_state) {
+            ggml_tensor * state_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, d_conv - 1, n_s);
+            state = ggml_transpose(ctx, state_base);
+        } else {
+            state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_s);
+        }
+        ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_t, d_inner, n_s);
+        ggml_tensor * weight  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * joined  = ggml_concat(ctx, state, current, 0);
+        return ggml_silu(ctx, ggml_ssm_conv(ctx, joined, weight));
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -8176,6 +8213,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    // Split-input concat + SSM_CONV + SILU, including partial final tiles, multiple sequences,
+    // and a transposed state whose dimension-0 stride is not sizeof(float).
+    for (int64_t n_t : {1, 3, 37, 64}) {
+        for (int64_t n_s : {1, 4}) {
+            for (bool strided_state : {false, true}) {
+                test_cases.emplace_back(new test_ssm_conv_concat_silu(4, 1024, n_t, n_s, strided_state));
+            }
         }
     }
 
