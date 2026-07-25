@@ -1631,6 +1631,33 @@ Q8_0的GL2C miss rate由 **52.18%降至32.71%**，miss events減少47.3%；Q4_K/
 
 已提交為`[verified] hip: reorder gfx1151 MMQ traversal`；尚未deployment。
 
+##### gfx1151 MoE Gate/Up shared preprocessing（candidate）
+
+CUDA graph executor原本能辨識`MUL_MAT_ID Gate + MUL_MAT_ID Up + SwiGLU`，但prefill MMQ不使用既有的single-token MMVQ fusion，因此Gate與Up會對相同activation與routing各自重做expert-ID compaction及Q8_1 activation quantization。Candidate在gfx1151、Q4_K、large-prefill、SwiGLU且backend確實選擇MMQ時，共用一次routing preprocessing與activation quantization，再依序執行原本兩個MMQ和SwiGLU；decode、其他GPU/type/op與fallback均不變。
+
+Exact-20K trace：
+
+- `mm_ids_helper<8>`：`4920 → 3280` launches，time `0.21655 → 0.13401 s`。
+- Gate/Up使用的Q8_1 quantization layout：`4800 → 3160` launches，time `0.24739 → 0.11857 s`。
+- Q4_K/Q5_K/Q8_0 MMQ dispatch數與weight-stationary specialization維持不變。
+
+相對`89b6e59`的3+3 interleaved exact-20K/256-token A/B：
+
+- Baseline median：**1184.69 TPS / 16.882 s**。
+- Shared preprocessing：**1199.51 TPS / 16.673 s**。
+- Prefill：**+1.25% TPS / -1.24% time**。
+
+驗證：
+
+- `MUL_MAT`/`MUL_MAT_ID` CUDA-vs-CPU：**1858/1858**。
+- Qwen35MoE architecture GPU-vs-CPU NMSE：`0.00e+00`。
+- Exact-20K + 63 returned tokens：token IDs、selected/Top-5 logprobs與message bit-identical，maximum delta `0.0`。
+- `-np 2` concurrent 20K/16-token requests通過。
+- Real Pi Agent 28,377-token prompt完成1,437-token merge-sort回答；抽取程式實際執行顯示`All tests passed`。Prefill為**1079.84 TPS**。
+- Independent Codex review：PASS，無blocking correctness或alias/lifetime finding。
+
+此candidate尚未commit或deployment。
+
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
@@ -1675,6 +1702,11 @@ SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.1
 - Weight-stationary numeric：`/tmp/qwen-weight-stationary-q45q8-numeric-20260725-184841/comparison.json`
 - Weight-stationary two-slot：`/tmp/qwen-weight-stationary-two-slot-20260725-185540/validation.json`
 - Weight-stationary Pi Agent end-to-end：`/tmp/qwen-weight-stationary-pi-e2e-20260725-203712/`
+- MoE shared-preprocessing trace：`/tmp/qwen-moe-shared-preprocess-trace-20260725-205438/`
+- MoE shared-preprocessing valid A/B：`/tmp/qwen-moe-shared-preprocess-ab-valid-20260725-210835/summary.json`
+- MoE shared-preprocessing numeric：`/tmp/qwen-moe-shared-preprocess-numeric-20260725-211334/comparison.json`
+- MoE shared-preprocessing two-slot：`/tmp/qwen-moe-shared-preprocess-two-slot-20260725-211700/validation.json`
+- MoE shared-preprocessing Pi Agent：`/tmp/qwen-moe-shared-preprocess-pi-e2e-20260725-211746/`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 

@@ -4195,6 +4195,12 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+void ggml_cuda_mul_mat_q_moe_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_up, const ggml_tensor * src0_gate,
+        const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst_up, ggml_tensor * dst_gate);
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

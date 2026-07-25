@@ -222,6 +222,79 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+void ggml_cuda_mul_mat_q_moe_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_up, const ggml_tensor * src0_gate,
+        const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst_up, ggml_tensor * dst_gate) {
+    GGML_ASSERT(src0_up->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(src0_gate->type == src0_up->type);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst_up->type == GGML_TYPE_F32 && dst_gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0_up, src0_gate));
+    GGML_ASSERT(ggml_are_same_stride(src0_up, src0_gate));
+    GGML_ASSERT(ggml_are_same_shape(dst_up, dst_gate));
+    GGML_ASSERT(ggml_are_same_stride(dst_up, dst_gate));
+    GGML_ASSERT(src1->ne[3] == 1);
+    GGML_ASSERT(src1->nb[2] % src1->nb[1] == 0);
+    GGML_ASSERT(dst_up->nb[2] % dst_up->nb[1] == 0);
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                           || GGML_CUDA_CC_IS_CDNA(cc);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0_up->ne[2] + 1);
+
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = src1->nb[2] / src1->nb[1];
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        src0_up->ne[2], ne12, n_expert_used, ne11, si1, sis1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+
+    const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+    const int64_t s12_src = src1->nb[2] / ggml_type_size(src1->type);
+    const int64_t s13_src = src1->nb[3] / ggml_type_size(src1->type);
+    quantize_mmq_q8_1_cuda((const float *) src1->data, ids_src1.get(), src1_q8_1.get(), src0_up->type,
+                           ne10, s11, s12_src, s13_src, ne10_padded,
+                           ne_get_rows, 1, 1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t stride_y_channel = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t stride_y_sample  = ne12 * stride_y_channel;
+
+    const auto launch = [&](const ggml_tensor * src0, ggml_tensor * dst) {
+        const int64_t ts_src0 = ggml_type_size(src0->type);
+        const int64_t ts_dst  = ggml_type_size(dst->type);
+        const mmq_args args = {
+            (const char *) src0->data, src0->type, (const int *) src1_q8_1.ptr,
+            ids_dst.get(), expert_bounds.get(), (float *) dst->data,
+            src0->ne[0], src0->ne[1], ne_get_rows, int64_t(src0->nb[1]) / ts_src0, ne_get_rows, int64_t(dst->nb[1]) / ts_dst,
+            src0->ne[2], src0->ne[2], int64_t(src0->nb[2]) / ts_src0, stride_y_channel, int64_t(dst->nb[2]) / ts_dst,
+            src0->ne[3], src1->ne[3], int64_t(src0->nb[3]) / ts_src0, stride_y_sample, int64_t(dst->nb[3]) / ts_dst,
+            use_stream_k, ne12};
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    };
+
+    launch(src0_up, dst_up);
+    launch(src0_gate, dst_gate);
+}
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

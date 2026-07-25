@@ -4125,6 +4125,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const bool use_shared_moe_preprocess = op == GGML_OP_MUL_MAT_ID && (cc & 0xffff) == 0x1151 &&
+                src0->type == GGML_TYPE_Q4_K && src1->ne[2] > MMVQ_MAX_BATCH_SIZE &&
+                ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], src0->ne[2]);
+            if (use_shared_moe_preprocess) {
+                ggml_cuda_mul_mat_q_moe_pair(*cuda_ctx, up->src[0], gate->src[0], src1, ids, up, gate);
+                ggml_cuda_op_swiglu(*cuda_ctx, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
         }
     }
 
