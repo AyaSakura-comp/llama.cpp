@@ -1658,7 +1658,7 @@ Exact-20K trace：
 
 已提交為`ebcf34c [verified] hip: share gfx1151 MoE preprocessing`；尚未deployment。
 
-##### gfx1151 paired Q4 MMQ → SwiGLU Q8_1 epilogue（candidate）
+##### gfx1151 paired Q4 MMQ → SwiGLU Q8_1 epilogue（deployed `d77c844`）
 
 在shared preprocessing之上，gfx1151 Q4_K prefill path以單一workgroup依序計算Gate與Up：Gate accumulator先存入額外LDS，重用同一組register計算Up，再於MMQ epilogue執行SwiGLU與DS4 Q8_1 requantization，直接交給Q5_K Down。Gate、Up與SwiGLU皆不再materialize為global F32；只有Down routing reduction後的hidden state維持F32。Decode、non-MMQ、split/non-local buffer、其他GPU/type與stream-K保留原fallback。
 
@@ -1678,6 +1678,14 @@ Exact-20K trace相對`ebcf34c`：
 - Prefill：**+1.52% TPS / -1.50% time**。
 
 驗證：11950/11950 ROCm backend operations、Qwen35MoE NMSE `9.40e-14`、exact-20K + 63 returned tokens bit-identical（maximum delta `0.0`）、`-np 2` concurrent 20K+7K requests、real Pi Agent 28,377-token merge-sort E2E（generated assertions pass）、trace guards與三輪independent Codex review均通過。
+
+Production deployment：
+
+```text
+/home/chihmin/llama-mtp-deploy/gfx1151-moe-mmq-q8-d77c844/bin/llama-server
+```
+
+部署後exact-20K smoke為**1227.67 TPS**，256-token decode為**64.76 TPS**；systemd實際載入同一self-contained deployment的`libggml-hip.so.0.11.1`。Rollback drop-in為`/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-d77c844`。
 
 #### Path toward 1500 TPS
 
@@ -1734,6 +1742,7 @@ SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.1
 - Paired Q4 MMQ Q8_1 multi-slot：`/tmp/qwen-moe-mmq-pair-q8-two-slot-20260726-003350/validation.json`
 - Paired Q4 MMQ Q8_1 Pi Agent：`/tmp/qwen-moe-mmq-pair-q8-pi-e2e-20260726-005106/`
 - Paired Q4 MMQ Q8_1 final review：`/tmp/qwen-moe-mmq-pair-q8-codex-final-review.txt`
+- `d77c844` production smoke：`/tmp/qwen-d77c844-deploy-smoke-20260726-010928/result.json`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 
