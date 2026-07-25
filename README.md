@@ -1596,16 +1596,28 @@ Q8_0實驗確認240 VGPR並不是唯一occupancy限制：128×128 MMQ tile使用
 - Numeric CUDA-vs-CPU fusion tests涵蓋`n_t=1/3/37/64`、`n_s=1/4`、contiguous與transposed/strided state，**16/16通過**；原SSM tests合計**61/61**。
 - 兩slot concurrent 20K/short request、Qwen35/Qwen35MoE architecture tests與independent Codex review均通過。
 
+##### Wider gfx1151 GDN workgroup
+
+針對Qwen使用的`S_v=128, KDA=false` Gated Delta Net，gfx1151把每個workgroup由4個warp擴成8個；其他state size、KDA vector-decay與非RDNA 3.5裝置仍走原本4-warp路徑。每個warp仍獨立負責一個state/output column，因此運算與reduction順序不變。
+
+- Final rocprof trace：1290次`gated_delta_net_cuda<128, false, 8>` dispatch，workgroup為`32×8`、grid-z為16；VGPR 32、LDS 0。
+- GDN kernel total：`1.278699 → 1.269986 s`，約 **-0.68%**（整體只省約8.7 ms）。
+- 兩輪獨立、各3+3次的interleaved exact-20K A/B median：分別 **+0.252%** 與 **+0.237% TPS**；合併6+6次median為`1141.82 → 1143.315 TPS`，**+0.131%**。
+- 這是可重現但幅度很小的prefill改善，不宣稱decode提升，也不改變1500 TPS仍需多瓶頸重構的結論。
+- Exact-20K + 63 selected tokens：token IDs與selected-token logprobs均bit-identical，最大delta `0.0`；GDN CUDA-vs-CPU 28/28、MUL_MAT/MUL_MAT_ID 1858/1858、Qwen35/Qwen35MoE與20K/short two-slot smoke均通過。
+- Independent Codex review無blocking finding；依review建議將8-warp範圍縮到實際已profile與測試的`KDA=false`路徑。
+
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
 
 1. **Global-final LM head（完成）**：實測+7.20%，production約1103 TPS。
 2. **Chunked SSM-conv concat fusion（完成）**：實測再+3.82%，median約1145 TPS。
-3. **Q8_0 compute/LDS**：240 VGPR之外還受57.9/64 KiB LDS限制；launch-bounds與rocBLAS替代均已證實無效，需要重構tile資料流而非單一dispatch knob。
-4. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
-5. **GDN kernel本體**：MemUnitBusy約94%，仍可研究state/output融合；materialized chunked concat已移除。
-6. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
+3. **gfx1151 GDN 8-warp（完成）**：合併6+6次median約+0.13%，只屬小幅改善。
+4. **Q8_0 compute/LDS**：240 VGPR之外還受57.9/64 KiB LDS限制；launch-bounds與rocBLAS替代均已證實無效，需要重構tile資料流而非單一dispatch knob。
+5. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
+6. **GDN kernel本體**：MemUnitBusy約94%，仍可研究state/output融合；materialized chunked concat已移除。
+7. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
 
 SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.13 s（23.6% wall time，或再增加31.0% TPS）。因此1500 TPS仍是跨MMQ、GDN與FA的組合目標，不可能靠單一cache knob完成。
 
@@ -1625,6 +1637,11 @@ SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.1
 - SSM fusion numeric comparison：`/tmp/qwen-fused-ssm-numeric-20260725-122044/`
 - SSM fusion multi-slot：`/tmp/qwen-fused-ssm-two-slot-20260725-122241/`
 - Production cold run：`/tmp/qwen-fused-ssm-production-20260725-123508/`
+- GDN 8-warp final trace：`/tmp/qwen-gdn8-trace-20260725-154534/`
+- GDN 8-warp A/B round 1：`/tmp/qwen-gdn8-ab-20260725-154901/summary.json`
+- GDN 8-warp A/B round 2：`/tmp/qwen-gdn8-ab-repeat-20260725-155531/summary.json`
+- GDN 8-warp numeric comparison：`/tmp/qwen-gdn8-numeric.json`
+- GDN 8-warp multi-slot：`/tmp/qwen-gdn8-two-slot-20260725-160132/`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 

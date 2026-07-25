@@ -1,7 +1,7 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+template <int S_v, bool KDA, int num_warps = 4>
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * num_warps, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -157,15 +157,14 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
+    const int cc         = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size  = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps  = S_v == 128 && !KDA && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 8 : 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
-
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     switch (S_v) {
         case 16:
@@ -188,10 +187,17 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            if (!KDA && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                gated_delta_net_cuda<128, KDA, 8><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            } else {
+                gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            }
             break;
         }
         default:
