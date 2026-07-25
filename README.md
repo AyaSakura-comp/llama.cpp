@@ -1066,13 +1066,13 @@ Interleaved exact-20K、`performance`結果：
 Live deployment：
 
 ```text
-/home/chihmin/llama-mtp-deploy/gfx1151-q4-32-q5-64-mtp-sparse-2d3f15e/bin/llama-server
+/home/chihmin/llama-mtp-deploy/gfx1151-q4-32-q5-64-mtp-global-final-675d2d6/bin/llama-server
 ```
 
 Rollback drop-in：
 
 ```text
-/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-2d3f15e
+/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-675d2d6
 ```
 
 ### Qwen 3.6 35B-A3B on gfx1151：UMA Memory Profiling
