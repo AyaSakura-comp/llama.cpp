@@ -1607,6 +1607,30 @@ Q8_0實驗確認240 VGPR並不是唯一occupancy限制：128×128 MMQ tile使用
 - Exact-20K + 63 selected tokens：token IDs與selected-token logprobs均bit-identical，最大delta `0.0`；GDN CUDA-vs-CPU 28/28、MUL_MAT/MUL_MAT_ID 1858/1858、Qwen35/Qwen35MoE與20K/short two-slot smoke均通過。
 - Independent Codex review無blocking finding；依review建議將8-warp範圍縮到實際已profile與測試的`KDA=false`路徑。
 
+##### gfx1151 weight-stationary MMQ traversal（verified）
+
+將gfx1151 conventional MMQ grid的token-tile與output-row-tile軸互換，讓連續workgroups改為改變token tile、保留相同weight-row tile，以縮短weight reuse distance。Q4_K/Q5_K只對MoE `MUL_MAT_ID`啟用；Q8_0對regular與MoE MMQ啟用。其他quant type、gfx1150、非gfx1151裝置、stream-K與超過portable grid-Y 65,535限制的shape維持原路徑。
+
+相對`f682936` exact-20K kernel trace：
+
+- Q4_K：`3.34095 → 3.18990 s`，**-4.52%**。
+- Q5_K：`2.27174 → 1.93326 s`，**-14.90%**。
+- Q8_0：`2.58929 → 2.48282 s`，**-4.11%**。
+- GPU kernel total：`17.37590 → 16.68427 s`，**-3.98%**。
+
+Q8_0的GL2C miss rate由 **52.18%降至32.71%**，miss events減少47.3%；Q4_K/Q5_K hit rate則幾乎不變，表示它們的收益主要來自較短reuse/latency queue distance，而不是較少的L2 miss事件。相對production `30b8617`的3+3 interleaved A/B：prefill median `1141.85 → 1185.45 TPS`，**+3.82%**；prompt time `17.515 → 16.871 s`，**-3.68%**。
+
+驗證：
+
+- `MUL_MAT`/`MUL_MAT_ID` CUDA-vs-CPU：**1858/1858**。
+- Qwen exact-20K + 63 returned tokens：token IDs、selected logprobs、Top-5與final message bit-identical，maximum delta `0.0`。
+- `-np 2` concurrent 20K/16-token requests皆成功，prompt accounting正確且first-token logprobs保持各自不同。
+- Real Pi Agent end-to-end：完整28,377-token agent prompt產生871-token merge-sort回答，wall time 43.0 s；輸出的type hints、docstring、complexity說明與assert tests完整，抽取後實際執行顯示`All tests passed`。
+- Trace：Q4_K 3280、Q5_K 1520、Q8_0 10320 dispatches皆使用weight-stationary specialization。
+- Independent review發現grid-Y上限與gfx1150 rollout範圍問題；candidate已增加`nty <= 65535` fallback並縮至exact gfx1151。
+
+已提交為`[verified] hip: reorder gfx1151 MMQ traversal`；尚未deployment。
+
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
@@ -1615,7 +1639,7 @@ Q8_0實驗確認240 VGPR並不是唯一occupancy限制：128×128 MMQ tile使用
 2. **Chunked SSM-conv concat fusion（完成）**：實測再+3.82%，median約1145 TPS。
 3. **gfx1151 GDN 8-warp（完成）**：合併6+6次median約+0.13%，只屬小幅改善。
 4. **Q8_0 compute/LDS**：240 VGPR之外還受57.9/64 KiB LDS限制；launch-bounds與rocBLAS替代均已證實無效，需要重構tile資料流而非單一dispatch knob。
-5. **Q4_K/Q5_K cache/latency**：45–56% L2 miss但DRAM未飽和；測試更好的weight traversal、prefetch、vector load和tile-K reuse，不應只追求更小tile。
+5. **Q4_K/Q5_K cache/latency**：weight-stationary traversal已完成，與Q8合計帶來+3.82% prefill；但MoE Q4/Q5 hit rate幾乎不變，下一步需設計expert-aware Gate+Up+SwiGLU與獨立Down epilogue，而非繼續只調grid順序。
 6. **GDN kernel本體**：MemUnitBusy約94%，仍可研究state/output融合；materialized chunked concat已移除。
 7. **Flash Attention**：18.8%，高L2 hit且低MemUnitBusy；需要compute/register方向，先前128 threads與batch32都regress，rocWMMA目前被ROCm 7.2.2相容性阻擋。
 
@@ -1642,6 +1666,15 @@ SSM concat fusion完成後，從17.461 s到1500 TPS的13.333 s仍需再省約4.1
 - GDN 8-warp A/B round 2：`/tmp/qwen-gdn8-ab-repeat-20260725-155531/summary.json`
 - GDN 8-warp numeric comparison：`/tmp/qwen-gdn8-numeric.json`
 - GDN 8-warp multi-slot：`/tmp/qwen-gdn8-two-slot-20260725-160132/`
+- Weight-stationary Q4/Q5 trace：`/tmp/qwen-weight-stationary-trace-20260725-181143/`
+- Weight-stationary Q4/Q5 cache：`/tmp/qwen-weight-stationary-cache-20260725-182233/`
+- Weight-stationary Q4/Q5 A/B：`/tmp/qwen-weight-stationary-ab-20260725-182420/summary.json`
+- Weight-stationary Q4/Q5/Q8 trace：`/tmp/qwen-weight-stationary-q8-trace-20260725-183135/`
+- Weight-stationary Q8 cache：`/tmp/qwen-weight-stationary-q8-cache-20260725-184212/`
+- Weight-stationary Q4/Q5/Q8 A/B：`/tmp/qwen-weight-stationary-q45q8-ab-20260725-184303/summary.json`
+- Weight-stationary numeric：`/tmp/qwen-weight-stationary-q45q8-numeric-20260725-184841/comparison.json`
+- Weight-stationary two-slot：`/tmp/qwen-weight-stationary-two-slot-20260725-185540/validation.json`
+- Weight-stationary Pi Agent end-to-end：`/tmp/qwen-weight-stationary-pi-e2e-20260725-203712/`
 - Wrapper：`/tmp/run_qwen_counter_profile.sh`
 - AMD GPUOpen WMMA reference：https://gpuopen.com/learn/wmma_on_rdna3/
 
