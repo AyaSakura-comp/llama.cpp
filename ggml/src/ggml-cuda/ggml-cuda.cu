@@ -2489,6 +2489,31 @@ static bool ggml_cuda_should_fuse_moe_mmq_q8_epilogue(
            is_local(up->src[1]) && is_local(up->src[2]) && is_local(down);
 }
 
+static bool ggml_cuda_should_fuse_moe_mmq_q8_epilogue_weighted(
+        const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * glu, const ggml_tensor * down,
+        const ggml_tensor * weights, const ggml_tensor * weighted) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_GFX1151_MOE_DOWN_WEIGHT") != nullptr;
+    if (disabled || !ggml_cuda_should_fuse_moe_mmq_q8_epilogue(up, gate, glu, down) ||
+        weighted->op != GGML_OP_MUL || weights->type != GGML_TYPE_F32 || weighted->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(weights) || !ggml_are_same_shape(down, weighted) || !ggml_are_same_stride(down, weighted) ||
+        weights->ne[0] != 1 || weights->ne[1] != down->ne[1] || weights->ne[2] != down->ne[2]) {
+        return false;
+    }
+
+    const int device = ggml_cuda_get_device();
+    const ggml_backend_dev_t active_device = ggml_backend_cuda_buffer_type(device)->device;
+    const bool integrated = ggml_cuda_info().devices[device].integrated;
+    const auto is_local = [active_device, integrated](const ggml_tensor * tensor) {
+        if (!tensor || !tensor->buffer || ggml_backend_buft_is_cuda_split(tensor->buffer->buft)) {
+            return false;
+        }
+        return (ggml_backend_buft_is_cuda(tensor->buffer->buft) && tensor->buffer->buft->device == active_device) ||
+               (integrated && ggml_backend_buft_is_cuda_host(tensor->buffer->buft));
+    };
+    return is_local(weights) && is_local(weighted);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -4117,6 +4142,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
         } else if (op == GGML_OP_MUL_MAT_ID &&
+                   ggml_can_fuse_subgraph(cgraph, i, { op, op, GGML_OP_GLU, GGML_OP_MUL_MAT_ID, GGML_OP_MUL }, { i + 4 }) &&
+                   ggml_cuda_should_fuse_moe_mmq_q8_epilogue_weighted(
+                       cgraph->nodes[i + 2]->src[1], cgraph->nodes[i + 2]->src[0],
+                       cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                       cgraph->nodes[i + 4]->src[0] == cgraph->nodes[i + 3] ? cgraph->nodes[i + 4]->src[1] : cgraph->nodes[i + 4]->src[0],
+                       cgraph->nodes[i + 4])) {
+            ggml_tensor * glu      = cgraph->nodes[i + 2];
+            ggml_tensor * down     = cgraph->nodes[i + 3];
+            ggml_tensor * weighted = cgraph->nodes[i + 4];
+            ggml_tensor * weights  = weighted->src[0] == down ? weighted->src[1] : weighted->src[0];
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+
+            const bool pair_ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) ||
+                                 (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
+            if (!pair_ok || down->src[1] != glu || down->src[2] != up->src[2] ||
+                gate->src[1] != up->src[1] || gate->src[2] != up->src[2]) {
+                continue;
+            }
+            if (weighted->src[0] != down && weighted->src[1] != down) {
+                continue;
+            }
+            const int out_node = i + 4;
+            if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &out_node, 1)) {
+                continue;
+            }
+
+            const ggml_tensor * src1 = up->src[1];
+            ggml_cuda_mul_mat_q_moe_swiglu_down(*cuda_ctx,
+                up->src[0], gate->src[0], src1, up->src[2], up, gate,
+                down->src[0], down, weights, weighted);
+            fused_mul_mat_vec = true;
+            fused_node_count = 5;
+            break;
+        } else if (op == GGML_OP_MUL_MAT_ID &&
                    ggml_can_fuse_subgraph(cgraph, i, { op, op, GGML_OP_GLU, GGML_OP_MUL_MAT_ID }, { i + 3 }) &&
                    ggml_cuda_should_fuse_moe_mmq_q8_epilogue(
                        cgraph->nodes[i + 2]->src[1], cgraph->nodes[i + 2]->src[0],
@@ -4139,7 +4199,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             const ggml_tensor * src1 = up->src[1];
             ggml_cuda_mul_mat_q_moe_swiglu_down(*cuda_ctx,
-                up->src[0], gate->src[0], src1, up->src[2], up, gate, down->src[0], down);
+                up->src[0], gate->src[0], src1, up->src[2], up, gate,
+                down->src[0], down, nullptr, nullptr);
             fused_mul_mat_vec = true;
             fused_node_count = 4;
             break;

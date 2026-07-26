@@ -3260,6 +3260,44 @@ static __device__ __forceinline__ void mmq_write_back_mma(
     }
 }
 
+template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
+static __device__ __forceinline__ void mmq_write_back_mma_weighted(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, const float * __restrict__ weights,
+        float * __restrict__ dst, const int stride, const int i_max, const int j_max) {
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int nwarps = mmq_get_nwarps_device();
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int tileC_IJ = mmq_get_granularity_device(0);
+    typedef tile<tileC_IJ, tileC_IJ, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    constexpr int rows_per_warp = granularity;
+#else
+    typedef tile<16, 8, int> tile_C;
+    constexpr int rows_per_warp = 2 * granularity;
+#endif
+    constexpr int ntx = rows_per_warp/tile_C::I;
+    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+#if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    static_assert(nwarps*tile_C::I == mmq_y, "nwarps*tile_C::I != mmq_y");
+#else
+    GGML_UNUSED(nwarps);
+#endif
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                if (j > j_max) continue;
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                if (need_check && i > i_max) continue;
+                const int dst_col = ids_dst[j];
+                dst[dst_col*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l] * weights[dst_col];
+            }
+        }
+    }
+}
+
 static __device__ __noinline__ float mmq_swiglu_materialize(const float gate, const float up) {
     return gate / (1.0f + expf(-gate)) * up;
 }
@@ -3553,14 +3591,15 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool fuse_swiglu_q8_1 = false>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool fuse_swiglu_q8_1 = false, bool fuse_output_weight = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
         const char * __restrict__ x_gate = nullptr, block_q8_1_mmq * __restrict__ dst_swiglu_q8_1 = nullptr,
-        const int shared_gate_offset = 0, const int q8_ncols = 0, const int row_offset = 0, const int compact_col_offset = 0) {
+        const int shared_gate_offset = 0, const int q8_ncols = 0, const int row_offset = 0, const int compact_col_offset = 0,
+        const float * __restrict__ output_weights = nullptr) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3672,6 +3711,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         mmq_write_back_swiglu_q8_1<type, mmq_x, mmq_y, need_check>(
             sum, gate_tile, dst_swiglu_q8_1, q8_ncols, row_offset,
             compact_col_offset, tile_x_max_i, tile_y_max_j, tile_out);
+    } else if constexpr (fuse_output_weight) {
+        static_assert(type == GGML_TYPE_Q5_K, "weighted MMQ epilogue is only instantiated for Q5_K Down");
+        static_assert(!fixup, "weighted MMQ epilogue does not support stream-K fixup");
+        mmq_write_back_mma_weighted<type, mmq_x, mmq_y, need_check>(
+            sum, ids_dst, output_weights, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
     } else if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
@@ -3682,7 +3726,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check, bool weight_stationary, bool fuse_swiglu_q8_1 = false>
+template <ggml_type type, int mmq_x, bool need_check, bool weight_stationary, bool fuse_swiglu_q8_1 = false, bool fuse_output_weight = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3701,7 +3745,8 @@ static __global__ void mul_mat_q(
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx, const char * __restrict__ x_gate = nullptr,
-        block_q8_1_mmq * __restrict__ dst_swiglu_q8_1 = nullptr, const int shared_gate_offset = 0, const int q8_ncols = 0) {
+        block_q8_1_mmq * __restrict__ dst_swiglu_q8_1 = nullptr, const int shared_gate_offset = 0, const int q8_ncols = 0,
+        const float * __restrict__ output_weights = nullptr) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3789,6 +3834,11 @@ static __global__ void mul_mat_q(
                 (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
                  stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
                  x_gate, dst_swiglu_q8_1, shared_gate_offset, q8_ncols, it*mmq_y, col_low + jt*mmq_x);
+        } else if constexpr (fuse_output_weight) {
+            mul_mat_q_process_tile<type, mmq_x, need_check, fixup, false, true>
+                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+                 nullptr, nullptr, 0, 0, 0, 0, output_weights);
         } else {
             mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
                 (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
@@ -4094,6 +4144,7 @@ struct mmq_args {
     void * dst_swiglu_q8_1 = nullptr;
     int64_t shared_gate_offset = 0;
     int64_t q8_ncols = 0;
+    const float * output_weights = nullptr;
 };
 
 template<ggml_type type>
@@ -4130,6 +4181,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true, true>), nbytes_shared_fused);
         CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true, true>), nbytes_shared_fused);
     }
+    if constexpr (type == GGML_TYPE_Q5_K) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true, false, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true, false, true>), nbytes_shared);
+    }
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
     const int ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
@@ -4151,6 +4206,30 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if (args.output_weights) {
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            GGML_ASSERT(!args.use_stream_k && weight_stationary && args.ids_dst && !args.dst_swiglu_q8_1);
+            if (args.nrows_x % mmq_y == 0) {
+                mul_mat_q<type, mmq_x, false, true, false, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd, nullptr, nullptr, 0, 0, args.output_weights);
+            } else {
+                mul_mat_q<type, mmq_x, true, true, false, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd, nullptr, nullptr, 0, 0, args.output_weights);
+            }
+        } else {
+            GGML_ABORT("weighted MMQ epilogue requires Q5_K");
+        }
+        return;
+    }
 
     if (args.dst_swiglu_q8_1) {
         if constexpr (type == GGML_TYPE_Q4_K) {
@@ -4403,7 +4482,8 @@ void ggml_cuda_mul_mat_q_moe_swiglu_down(
         const ggml_tensor * src0_up, const ggml_tensor * src0_gate,
         const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst_up, ggml_tensor * dst_gate,
-        const ggml_tensor * src0_down, ggml_tensor * dst_down);
+        const ggml_tensor * src0_down, ggml_tensor * dst_down,
+        const ggml_tensor * weights, ggml_tensor * dst_weighted);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,

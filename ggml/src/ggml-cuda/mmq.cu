@@ -300,16 +300,23 @@ void ggml_cuda_mul_mat_q_moe_swiglu_down(
         const ggml_tensor * src0_up, const ggml_tensor * src0_gate,
         const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst_up, ggml_tensor * dst_gate,
-        const ggml_tensor * src0_down, ggml_tensor * dst_down) {
+        const ggml_tensor * src0_down, ggml_tensor * dst_down,
+        const ggml_tensor * weights, ggml_tensor * dst_weighted) {
     GGML_ASSERT(src0_up->type == GGML_TYPE_Q4_K && src0_gate->type == GGML_TYPE_Q4_K);
     GGML_ASSERT(src0_down->type == GGML_TYPE_Q5_K);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(dst_up->type == GGML_TYPE_F32 && dst_gate->type == GGML_TYPE_F32 && dst_down->type == GGML_TYPE_F32);
+    const bool fuse_output_weight = weights != nullptr;
+    GGML_ASSERT(fuse_output_weight == (dst_weighted != nullptr));
+    GGML_ASSERT(!fuse_output_weight || (weights->type == GGML_TYPE_F32 && dst_weighted->type == GGML_TYPE_F32));
     GGML_ASSERT(ggml_are_same_shape(src0_up, src0_gate) && ggml_are_same_stride(src0_up, src0_gate));
     GGML_ASSERT(ggml_are_same_shape(dst_up, dst_gate));
     GGML_ASSERT(src0_down->ne[0] == src0_up->ne[1] && src0_down->ne[2] == src0_up->ne[2]);
     GGML_ASSERT(src1->ne[3] == 1 && src1->nb[2] % src1->nb[1] == 0);
     GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    GGML_ASSERT(!fuse_output_weight || (ggml_are_same_shape(dst_down, dst_weighted) && ggml_are_same_stride(dst_down, dst_weighted)));
+    GGML_ASSERT(!fuse_output_weight || (weights->ne[0] == 1 && weights->ne[1] == ids->ne[0] && weights->ne[2] == src1->ne[2]));
+    GGML_ASSERT(!fuse_output_weight || ggml_is_contiguous(weights));
 
     cudaStream_t stream = ctx.stream();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -366,18 +373,20 @@ void ggml_cuda_mul_mat_q_moe_swiglu_down(
     up_args.q8_ncols = ne_get_rows;
     ggml_cuda_mul_mat_q_switch_type(ctx, up_args, stream);
 
+    ggml_tensor * dst_final = fuse_output_weight ? dst_weighted : dst_down;
     const int64_t ts_down = ggml_type_size(src0_down->type);
     const int64_t down_stride_y = ne_get_rows*ne_swiglu_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
-    const mmq_args down_args = {
+    mmq_args down_args = {
         (const char *) src0_down->data, src0_down->type, (const int *) swiglu_q8_1.ptr,
-        ids_dst.get(), expert_bounds.get(), (float *) dst_down->data,
+        ids_dst.get(), expert_bounds.get(), (float *) dst_final->data,
         src0_down->ne[0], src0_down->ne[1], ne_get_rows,
-        int64_t(src0_down->nb[1])/ts_down, ne_get_rows, int64_t(dst_down->nb[1]/sizeof(float)),
+        int64_t(src0_down->nb[1])/ts_down, ne_get_rows, int64_t(dst_final->nb[1]/sizeof(float)),
         src0_down->ne[2], src0_down->ne[2], int64_t(src0_down->nb[2])/ts_down,
-        down_stride_y, int64_t(dst_down->nb[2]/sizeof(float)),
+        down_stride_y, int64_t(dst_final->nb[2]/sizeof(float)),
         src0_down->ne[3], 1, int64_t(src0_down->nb[3])/ts_down,
-        down_stride_y, int64_t(dst_down->nb[3]/sizeof(float)),
+        down_stride_y, int64_t(dst_final->nb[3]/sizeof(float)),
         false, ne12};
+    down_args.output_weights = fuse_output_weight ? (const float *) weights->data : nullptr;
     ggml_cuda_mul_mat_q_switch_type(ctx, down_args, stream);
     GGML_UNUSED(dst_up);
     GGML_UNUSED(dst_gate);
