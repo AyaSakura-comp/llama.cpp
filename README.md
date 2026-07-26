@@ -1687,6 +1687,20 @@ Production deployment：
 
 部署後exact-20K smoke為**1227.67 TPS**，256-token decode為**64.76 TPS**；systemd實際載入同一self-contained deployment的`libggml-hip.so.0.11.1`。Rollback drop-in為`/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-d77c844`。
 
+##### gfx1151 Q5_K Down expert-weight epilogue（deployed `07689bc`）
+
+將routing-selected expert weight乘法移入Q5_K Down MMQ writeback，直接由register accumulator產生最終F32 expert output，移除獨立`MUL` kernel與其中間global F32讀寫。新路徑只適用於exact gfx1151、Q5_K Down、contiguous F32 selected weights、local/non-split buffers及non-stream-K weight-stationary MMQ；`GGML_CUDA_DISABLE_GFX1151_MOE_DOWN_WEIGHT=1`只停用新weight epilogue，仍保留既有四節點Gate/Up/SwiGLU/Down fusion。
+
+相同ROCm 7.2.2 binary的5+5 interleaved exact-20K A/B：median **1216.95 → 1240.51 TPS（+1.936%）**。Exact-20K deterministic output tokens完全相同、maximum logprob delta `0.0`；Qwen35MoE architecture NMSE `9.20e-14`，weighted trace、two-slot runtime、real Pi Agent及independent review通過。
+
+Production deployment：
+
+```text
+/home/chihmin/llama-mtp-deploy/gfx1151-moe-down-weight-07689bc/bin/llama-server
+```
+
+部署後exact-20K smoke為**1262.12 TPS**，256-token decode為**64.52 TPS**，MTP acceptance **98.148%**。Pi Agent smoke為28,369 prompt tokens、**1113.98 prefill TPS**。Rollback drop-in為`/etc/systemd/system/qwen-mtp.service.d/optimized.conf.pre-07689bc`。
+
 #### Path toward 1500 TPS
 
 達到1500還需跨多個瓶頸：
