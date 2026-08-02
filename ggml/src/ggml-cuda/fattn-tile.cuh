@@ -215,6 +215,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 512, 1, 128,  64)
@@ -292,6 +293,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 256, 4,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
@@ -1390,7 +1392,7 @@ static bool launch_fattn_tile_q4_0_gfx1151(ggml_backend_cuda_context & ctx, ggml
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     if (!enabled || (cc & 0xffff) != 0x1151 ||
             K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 ||
-            Q->ne[1] < 1 || Q->ne[1] > 2 || Q->ne[2]/K->ne[2] != 8 ||
+            Q->ne[1] < 1 || Q->ne[1] > 4 || Q->ne[2]/K->ne[2] != 8 ||
             !mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0) {
         return false;
     }
@@ -1411,15 +1413,31 @@ static bool launch_fattn_tile_q4_0_gfx1151(ggml_backend_cuda_context & ctx, ggml
         return true;
     }
 
-    constexpr int ncols1 = 2;
-    const int nwarps = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2, cc)/warp_size;
-    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
-    fattn_kernel_t kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, GGML_TYPE_Q4_0>;
-    constexpr bool need_f16_K = type_KV == GGML_TYPE_F16;
-    constexpr bool need_f16_V = type_KV == GGML_TYPE_F16;
-    launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared, nbatch_fa,
-        need_f16_K, need_f16_V, false, warp_size);
-    return true;
+    if (Q->ne[1] == 2) {
+        constexpr int ncols1 = 2;
+        const int nwarps = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2, cc)/warp_size;
+        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
+        fattn_kernel_t kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, GGML_TYPE_Q4_0>;
+        constexpr bool need_f16_K = type_KV == GGML_TYPE_F16;
+        constexpr bool need_f16_V = type_KV == GGML_TYPE_F16;
+        launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared, nbatch_fa,
+            need_f16_K, need_f16_V, false, warp_size);
+        return true;
+    }
+
+    if (Q->ne[1] == 3 || Q->ne[1] == 4) {
+        constexpr int ncols1 = 4;
+        const int nwarps = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2, cc)/warp_size;
+        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
+        fattn_kernel_t kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, GGML_TYPE_Q4_0>;
+        constexpr bool need_f16_K = type_KV == GGML_TYPE_F16;
+        constexpr bool need_f16_V = type_KV == GGML_TYPE_F16;
+        launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared, nbatch_fa,
+            need_f16_K, need_f16_V, false, warp_size);
+        return true;
+    }
+
+    return false;
     }
 }
 

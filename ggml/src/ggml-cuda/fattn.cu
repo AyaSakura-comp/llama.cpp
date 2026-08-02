@@ -342,7 +342,7 @@ static bool ggml_cuda_use_gfx1151_q4_kv_tiled_fattn(
     static const bool enabled = std::getenv("GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED") != nullptr;
     return enabled && (cc & 0xffff) == 0x1151 &&
         K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
-        Q->ne[0] == 256 && Q->ne[1] <= 2 &&
+        Q->ne[0] == 256 && Q->ne[1] <= 4 &&
         Q->ne[2] == 8*K->ne[2] && mask && max_bias == 0.0f &&
         K->ne[1] % FATTN_KQ_STRIDE == 0;
 }
