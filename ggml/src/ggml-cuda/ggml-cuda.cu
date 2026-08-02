@@ -1,6 +1,8 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include <unordered_set>
+
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -3898,6 +3900,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    static thread_local std::unordered_set<const ggml_tensor*> tls_fused_completed_nodes;
+
+    if (tls_fused_completed_nodes.count(node)) {
+        tls_fused_completed_nodes.erase(node);
+        return 1;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q4_0 && node->src[1]->type == GGML_TYPE_F32 && node->src[1]->ne[1] <= 4) {
+        const ggml_tensor * cur = node->src[1];
+        std::vector<ggml_tensor*> matching_nodes;
+        for (int k = i; k < std::min(i + 30, cgraph->n_nodes); ++k) {
+            ggml_tensor * cand = cgraph->nodes[k];
+            if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == cur && cand->src[0]->type == GGML_TYPE_Q4_0) {
+                matching_nodes.push_back(cand);
+            }
+        }
+
+        if (matching_nodes.size() == 3 && node == matching_nodes[0]) {
+            ggml_tensor * node_q = matching_nodes[0];
+            ggml_tensor * node_k = matching_nodes[1];
+            ggml_tensor * node_v = matching_nodes[2];
+
+            bool fused = ggml_cuda_fused_qkv_matvec_q4_0(
+                *cuda_ctx,
+                node_q->src[0], node_k->src[0], node_v->src[0],
+                cur,
+                node_q, node_k, node_v);
+            if (fused) {
+                tls_fused_completed_nodes.insert(node_k);
+                tls_fused_completed_nodes.insert(node_v);
+                return 0;
+            }
+        }
+    }
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

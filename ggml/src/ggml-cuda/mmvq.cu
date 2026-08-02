@@ -1168,3 +1168,206 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+template <int ncols_dst>
+__launch_bounds__(calc_nwarps(GGML_TYPE_Q4_0, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q4_0_fused_qkv(
+        const void * __restrict__ vx_q,
+        const void * __restrict__ vx_k,
+        const void * __restrict__ vx_v,
+        const void * __restrict__ vy,
+        float * __restrict__ dst_q,
+        float * __restrict__ dst_k,
+        float * __restrict__ dst_v,
+        const uint32_t nrows_q,
+        const uint32_t nrows_k,
+        const uint32_t nrows_v,
+        const uint32_t ncols_x,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y) {
+
+    constexpr ggml_type type = GGML_TYPE_Q4_0;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    const void * vx_curr;
+    float * dst_curr;
+    int row_offset;
+    uint32_t stride_col_dst;
+
+    if (row0 < (int)nrows_q) {
+        vx_curr = vx_q;
+        dst_curr = dst_q;
+        row_offset = row0;
+        stride_col_dst = nrows_q;
+    } else if (row0 < (int)(nrows_q + nrows_k)) {
+        vx_curr = vx_k;
+        dst_curr = dst_k;
+        row_offset = row0 - nrows_q;
+        stride_col_dst = nrows_k;
+    } else {
+        vx_curr = vx_v;
+        dst_curr = dst_v;
+        row_offset = row0 - nrows_q - nrows_k;
+        stride_col_dst = nrows_v;
+    }
+
+    // partial sum for each thread
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int kbx_offset = row_offset * stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] += vec_dot_q_cuda(
+                    vx_curr, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    dst_curr += row_offset;
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+        }
+    }
+
+    if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row_offset + threadIdx.x) < stride_col_dst)) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            dst_curr[j * stride_col_dst + threadIdx.x] = tmp[j][threadIdx.x];
+        }
+    }
+}
+
+bool ggml_cuda_fused_qkv_matvec_q4_0(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * wq, const ggml_tensor * wk, const ggml_tensor * wv,
+        const ggml_tensor * src1,
+        ggml_tensor * dst_q, ggml_tensor * dst_k, ggml_tensor * dst_v) {
+
+    if (!wq || !wk || !wv || !src1 || !dst_q || !dst_k || !dst_v) return false;
+    if (wq->type != GGML_TYPE_Q4_0 || wk->type != GGML_TYPE_Q4_0 || wv->type != GGML_TYPE_Q4_0) return false;
+    if (src1->type != GGML_TYPE_F32 || dst_q->type != GGML_TYPE_F32 || dst_k->type != GGML_TYPE_F32 || dst_v->type != GGML_TYPE_F32) return false;
+
+    const int64_t ncols_dst = src1->ne[1];
+    if (ncols_dst < 1 || ncols_dst > 4) return false;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+
+    const int64_t ne00 = wq->ne[0];
+    if (wk->ne[0] != ne00 || wv->ne[0] != ne00) return false;
+
+    const int64_t nrows_q = wq->ne[1];
+    const int64_t nrows_k = wk->ne[1];
+    const int64_t nrows_v = wv->ne[1];
+
+    const int64_t total_rows = nrows_q + nrows_k + nrows_v;
+
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    const int nwarps = calc_nwarps(GGML_TYPE_Q4_0, ncols_dst, table_id);
+    const int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+
+    if (nrows_q % rows_per_cuda_block != 0 || nrows_k % rows_per_cuda_block != 0 || nrows_v % rows_per_cuda_block != 0) return false;
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        static thread_local const void * tls_last_src1_d = nullptr;
+        static thread_local int64_t tls_last_ne10 = 0;
+        static thread_local void * tls_last_q8_buf = nullptr;
+
+        const float * src1_d = (const float *) src1->data;
+        if (src1_d != tls_last_src1_d || ne10 != tls_last_ne10 || src1_q8_1.get() != tls_last_q8_buf) {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), wq->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            tls_last_src1_d = src1_d;
+            tls_last_ne10 = ne10;
+            tls_last_q8_buf = src1_q8_1.get();
+        }
+    }
+
+    const int stride_row_x = ne00 / ggml_blck_size(wq->type);
+    const int stride_col_y = ne10_padded / QK8_1;
+
+    dim3 block_dims(warp_size, nwarps, 1);
+    dim3 block_nums((total_rows + rows_per_cuda_block - 1) / rows_per_cuda_block, 1, 1);
+
+    if (ncols_dst == 1) {
+        mul_mat_vec_q4_0_fused_qkv<1><<<block_nums, block_dims, 0, stream>>>(
+            wq->data, wk->data, wv->data, src1_q8_1.get(),
+            (float*)dst_q->data, (float*)dst_k->data, (float*)dst_v->data,
+            nrows_q, nrows_k, nrows_v, ne00, stride_row_x, stride_col_y);
+    } else if (ncols_dst == 2) {
+        mul_mat_vec_q4_0_fused_qkv<2><<<block_nums, block_dims, 0, stream>>>(
+            wq->data, wk->data, wv->data, src1_q8_1.get(),
+            (float*)dst_q->data, (float*)dst_k->data, (float*)dst_v->data,
+            nrows_q, nrows_k, nrows_v, ne00, stride_row_x, stride_col_y);
+    } else if (ncols_dst == 3) {
+        mul_mat_vec_q4_0_fused_qkv<3><<<block_nums, block_dims, 0, stream>>>(
+            wq->data, wk->data, wv->data, src1_q8_1.get(),
+            (float*)dst_q->data, (float*)dst_k->data, (float*)dst_v->data,
+            nrows_q, nrows_k, nrows_v, ne00, stride_row_x, stride_col_y);
+    } else if (ncols_dst == 4) {
+        mul_mat_vec_q4_0_fused_qkv<4><<<block_nums, block_dims, 0, stream>>>(
+            wq->data, wk->data, wv->data, src1_q8_1.get(),
+            (float*)dst_q->data, (float*)dst_k->data, (float*)dst_v->data,
+            nrows_q, nrows_k, nrows_v, ne00, stride_row_x, stride_col_y);
+    }
+
+    return true;
+}
