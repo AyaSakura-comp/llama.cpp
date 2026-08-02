@@ -336,6 +336,17 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
 
+static bool ggml_cuda_use_gfx1151_q4_kv_tiled_fattn(
+        const int cc, const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
+        const ggml_tensor * mask, const float max_bias) {
+    static const bool enabled = std::getenv("GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED") != nullptr;
+    return enabled && (cc & 0xffff) == 0x1151 &&
+        K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        Q->ne[0] == 256 && Q->ne[1] <= 2 &&
+        Q->ne[2] == 8*K->ne[2] && mask && max_bias == 0.0f &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -370,6 +381,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    if (ggml_cuda_use_gfx1151_q4_kv_tiled_fattn(cc, Q, K, V, mask, max_bias)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
 
     switch (K->ne[0]) {
         case  40:
