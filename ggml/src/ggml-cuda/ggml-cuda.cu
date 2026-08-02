@@ -3936,6 +3936,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_MUL_MAT && node->src[1]->type == GGML_TYPE_F32 && node->src[1]->ne[1] <= 4) {
+        const ggml_tensor * cur = node->src[1];
+        std::vector<ggml_tensor*> matching_gate_up;
+        for (int k = i; k < std::min(i + 15, cgraph->n_nodes); ++k) {
+            ggml_tensor * cand = cgraph->nodes[k];
+            if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == cur && cand->src[0]->type == node->src[0]->type) {
+                matching_gate_up.push_back(cand);
+            }
+        }
+
+        if (matching_gate_up.size() == 2 && node == matching_gate_up[0]) {
+            ggml_tensor * node_gate = matching_gate_up[0];
+            ggml_tensor * node_up   = matching_gate_up[1];
+
+            bool fused = ggml_cuda_fused_gate_up_matvec(
+                *cuda_ctx,
+                node_gate->src[0], node_up->src[0],
+                cur,
+                node_gate, node_up);
+            if (fused) {
+                tls_fused_completed_nodes.insert(node_up);
+                return 0;
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {

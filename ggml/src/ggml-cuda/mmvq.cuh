@@ -21,3 +21,9 @@ bool ggml_cuda_fused_qkv_matvec_q4_0(
     const ggml_tensor * src1,
     ggml_tensor * dst_q, ggml_tensor * dst_k, ggml_tensor * dst_v);
 
+bool ggml_cuda_fused_gate_up_matvec(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * wgate, const ggml_tensor * wup,
+    const ggml_tensor * src1,
+    ggml_tensor * dst_gate, ggml_tensor * dst_up);
+
