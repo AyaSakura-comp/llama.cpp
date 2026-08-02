@@ -1094,10 +1094,19 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        static thread_local const void * tls_last_src1_d = nullptr;
+        static thread_local int64_t tls_last_ne10 = 0;
+        static thread_local void * tls_last_q8_buf = nullptr;
+
+        if (src1_d != tls_last_src1_d || ne10 != tls_last_ne10 || src1_q8_1.get() != tls_last_q8_buf) {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            tls_last_src1_d = src1_d;
+            tls_last_ne10 = ne10;
+            tls_last_q8_buf = src1_q8_1.get();
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
