@@ -584,22 +584,12 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
                 ++i_batch;
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                // add drafted token for each sequence
+                const auto * cur_p = common_sampler_get_candidates(smpl, false);
                 const llama_token id = cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
-
                     continue;
                 }
 
@@ -625,7 +615,6 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 break;
             }
 
-            // evaluate the drafted tokens on the draft model
             ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
