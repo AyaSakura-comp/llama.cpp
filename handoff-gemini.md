@@ -51,6 +51,10 @@ This document summarizes all completed micro-architectural optimizations, curren
    - **Commit**: [`8f0987060`](file:///home/chihmin/llama-mtp-opt/common/speculative.cpp#L407) (`speculative.cpp`, `ab-run.sh`, `trace-decode.sh`)
    - **Details**: Bound GPU-accelerated sampler directly on `ctx_dft` in `common_speculative_state_mtp`, eliminating CPU candidate sorting over 248k logits. Updated Hermes profiling skills (`ab-qwen-profiling` & `rocm-kernel-trace`) to automatically append `GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED=1` for Q4_0 KV cache variants, restoring full performance parity at **64.63 tok/s** with **97.69% MTP acceptance**.
 
+7. **Milestone 7: Native HIP CUDA Fused MoE Gate/Up Kernel (`mul_mat_vec_fused_gate_up`)**
+   - **Commit**: [`6489d11f9`](file:///home/chihmin/llama-mtp-opt/ggml/src/ggml-cuda/mmvq.cu#L1374) (`mmvq.cu`, `mmvq.cuh`, `ggml-cuda.cu`)
+   - **Details**: Implemented native HIP CUDA kernel `mul_mat_vec_fused_gate_up` supporting Q4_0, Q4_K, and Q5_K format fusion for MoE SwiGLU expert layers. Fuses $W_{gate}$ and $W_{up}$ matrix-vector projections into 1 single HIP grid launch per expert, eliminating 50% of MoE Gate/Up grid launches and pushing peak decode throughput to **66.25 tok/s** (15.09 ms/tok).
+
 ---
 
 ## 🔍 Key Reference Files & Build Commands
