@@ -47,6 +47,10 @@ This document summarizes all completed micro-architectural optimizations, curren
    - **Commit**: [`db1d087bb`](file:///home/chihmin/llama-mtp-opt/ggml/src/ggml-cuda/mmvq.cu#L1172) (`mmvq.cu`, `mmvq.cuh`, `ggml-cuda.cu`)
    - **Details**: Implemented `mul_mat_vec_q4_0_fused_qkv` and auto-fusion lookahead hook in `ggml_cuda_try_fuse`. Fuses $W_q, W_k, W_v$ linear projections into a single HIP grid launch, eliminating 66% of QKV kernel dispatches per layer and increasing decode throughput to **65.35 tok/s** (peak **66.03 tok/s**).
 
+6. **Milestone 6: MTP Draft Loop Sampling Acceleration & Hermes Skills Integration**
+   - **Commit**: [`8f0987060`](file:///home/chihmin/llama-mtp-opt/common/speculative.cpp#L407) (`speculative.cpp`, `ab-run.sh`, `trace-decode.sh`)
+   - **Details**: Bound GPU-accelerated sampler directly on `ctx_dft` in `common_speculative_state_mtp`, eliminating CPU candidate sorting over 248k logits. Updated Hermes profiling skills (`ab-qwen-profiling` & `rocm-kernel-trace`) to automatically append `GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED=1` for Q4_0 KV cache variants, restoring full performance parity at **64.63 tok/s** with **97.69% MTP acceptance**.
+
 ---
 
 ## 🔍 Key Reference Files & Build Commands
@@ -65,5 +69,5 @@ This document summarizes all completed micro-architectural optimizations, curren
     --tokens 512 \
     --samples 3 \
     --variant 'f16prod=/home/chihmin/llama-mtp-deploy/gfx1151-moe-down-weight-07689bc/bin/llama-server' \
-    --variant 'q40_shortlist_act_cache=/home/chihmin/llama-mtp-opt/build/bin/llama-server|model=/home/chihmin/models/Qwen3.6-35B-A3B-UD-Q4_K_M-selective-Q4_0-lmhead_q40.gguf|kv=q4_0|env=GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED=1:GGML_CUDA_EXPERIMENTAL_DYNAMIC_SHORTLIST=8192'
+    --variant 'q40_fused_qkv=/home/chihmin/llama-mtp-opt/build/bin/llama-server|kv=q4_0'
   ```
