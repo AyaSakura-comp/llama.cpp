@@ -230,7 +230,19 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     // LM head
-    cur = build_lora_mm(model.output, cur);
+    static const char * env_shortlist = getenv("GGML_CUDA_EXPERIMENTAL_DYNAMIC_SHORTLIST");
+    if (env_shortlist && cur->ne[1] == 1) {
+        int n_shortlist = atoi(env_shortlist);
+        if (n_shortlist <= 0) n_shortlist = 8192;
+        if (n_shortlist > model.output->ne[1]) n_shortlist = model.output->ne[1];
+
+        ggml_tensor * t_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_shortlist);
+        ggml_set_name(t_ids, "lm_head_shortlist_ids");
+
+        cur = build_lora_mm_id(model.output, cur, t_ids);
+    } else {
+        cur = build_lora_mm(model.output, cur);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

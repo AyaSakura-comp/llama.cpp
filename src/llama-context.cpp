@@ -1846,7 +1846,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT(dst_row + rows_to_copy <= n_outputs_all);
                 GGML_ASSERT((dst_row + rows_to_copy)*n_vocab <= (int64_t) logits.size);
                 GGML_ASSERT(rows_to_copy <= n_logits_rows);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, rows_to_copy*n_vocab*sizeof(float));
+                const int64_t n_logits_cols = t_logits->ne[0];
+                if (n_logits_cols < n_vocab) {
+                    std::fill(logits_out, logits_out + rows_to_copy*n_vocab, -10000.0f);
+                    std::vector<float> short_buf(rows_to_copy * n_logits_cols);
+                    ggml_backend_tensor_get_async(backend_res, t_logits, short_buf.data(), 0, short_buf.size()*sizeof(float));
+                    ggml_backend_sched_synchronize(sched.get());
+                    for (int64_t r = 0; r < rows_to_copy; ++r) {
+                        for (int64_t c = 0; c < n_logits_cols; ++c) {
+                            logits_out[r*n_vocab + c] = short_buf[r*n_logits_cols + c];
+                        }
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, rows_to_copy*n_vocab*sizeof(float));
+                }
                 if (cparams.mtp_prefill_logits_last) {
                     std::fill(logits_valid.begin() + dst_row, logits_valid.begin() + dst_row + rows_to_copy, 1);
                 }
