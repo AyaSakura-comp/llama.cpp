@@ -7,7 +7,42 @@
 #        define CUB_TOP_K_AVAILABLE
 using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+#elif defined(GGML_USE_HIP)
+#    include <hipcub/hipcub.hpp>
 #endif      // GGML_CUDA_USE_CUB
+
+#ifdef GGML_USE_HIP
+static __global__ void top_k_init_indices(int * indices, const int ncols) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < ncols) {
+        indices[col] = col;
+    }
+}
+
+static void top_k_hip(ggml_cuda_pool & pool, const float * src, int * dst,
+                      const int ncols, const int nrows, const int k, cudaStream_t stream) {
+    ggml_cuda_pool_alloc<float> keys_out_alloc(pool, ncols * nrows);
+    ggml_cuda_pool_alloc<int> indices_in_alloc(pool, ncols * nrows);
+    ggml_cuda_pool_alloc<int> indices_out_alloc(pool, ncols * nrows);
+    float * keys_out = keys_out_alloc.get();
+    int * indices_in = indices_in_alloc.get();
+    int * indices_out = indices_out_alloc.get();
+
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(nullptr, temp_storage_bytes,
+               src, keys_out, indices_in, indices_out, ncols, 0, sizeof(float) * 8, stream));
+    ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
+
+    for (int row = 0; row < nrows; ++row) {
+        top_k_init_indices<<<(ncols + 255) / 256, 256, 0, stream>>>(indices_in + row * ncols, ncols);
+        CUDA_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(temp_storage_alloc.get(), temp_storage_bytes,
+                   src + row * ncols, keys_out + row * ncols, indices_in + row * ncols,
+                   indices_out + row * ncols, ncols, 0, sizeof(float) * 8, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst + row * k, indices_out + row * ncols,
+                   k * sizeof(int), cudaMemcpyDeviceToDevice, stream));
+    }
+}
+#endif
 
 #ifdef CUB_TOP_K_AVAILABLE
 
@@ -62,6 +97,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+#ifdef GGML_USE_HIP
+    if (ncols > 1024) {
+        top_k_hip(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+#endif
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
