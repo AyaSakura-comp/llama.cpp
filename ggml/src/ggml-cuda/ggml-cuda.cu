@@ -3027,6 +3027,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ROWS:
+            ggml_cuda_mul_mat_rows_q(ctx, dst->src[0], dst->src[1], dst->src[2], dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -5312,6 +5315,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_MUL_MAT_ROWS:
+            // stage 2 of a retrieval head: quantised weights, F32 activations, I32 index list
+            return ggml_is_quantized(op->src[0]->type)
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[2]->type == GGML_TYPE_I32
+                && op->src[0]->ne[0] % QK8_1 == 0
+                && op->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

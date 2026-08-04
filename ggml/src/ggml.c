@@ -1078,9 +1078,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MUL_MAT_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1189,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "a[ids]*b",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3288,6 +3290,31 @@ void ggml_mul_mat_set_hint(
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
 */
+// ggml_mul_mat_rows
+
+struct ggml_tensor * ggml_mul_mat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(a->ne[0] == b->ne[0]);   // shared contraction dimension
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+
+    const int64_t ne[4] = { ids->ne[0], b->ne[1], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = ids;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

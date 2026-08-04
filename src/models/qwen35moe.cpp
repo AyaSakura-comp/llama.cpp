@@ -1,4 +1,7 @@
 #include "models.h"
+
+#include <cinttypes>
+#include <algorithm>
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -51,6 +54,23 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+
+    // FlashHead tables, optional: a model exported without them just uses the dense
+    // head. Their sizes (cluster count, cluster size, static set) are properties of
+    // the export rather than of the architecture, so read them off the file.
+    if (const ggml_tensor * meta_c = ml.get_tensor_meta("flashhead.centroids")) {
+        const ggml_tensor * meta_m = ml.get_tensor_meta("flashhead.c2t");
+        const ggml_tensor * meta_s = ml.get_tensor_meta("flashhead.static");
+        if (meta_m && meta_s) {
+            flashhead_centroids = create_tensor(tn(LLM_TENSOR_FLASHHEAD_CENTROIDS), { n_embd, meta_c->ne[1] }, 0);
+            flashhead_c2t       = create_tensor(tn(LLM_TENSOR_FLASHHEAD_C2T),       { meta_m->ne[0], meta_m->ne[1] }, 0);
+            flashhead_static    = create_tensor(tn(LLM_TENSOR_FLASHHEAD_STATIC),    { meta_s->ne[0] }, 0);
+            LLAMA_LOG_INFO("%s: FlashHead tables found - %" PRId64 " clusters of %" PRId64 ", %" PRId64 " static tokens\n",
+                    __func__, meta_c->ne[1], meta_m->ne[0], meta_s->ne[0]);
+        } else {
+            LLAMA_LOG_WARN("%s: flashhead.centroids present but c2t/static missing - using the dense head\n", __func__);
+        }
+    }
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
@@ -784,7 +804,46 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur);
+
+    // FlashHead, draft side only.
+    //
+    // The draft head re-reads the whole [n_embd, n_vocab] projection once per drafted
+    // token and is the single largest consumer of memory bandwidth in decode. Score the
+    // cluster centroids instead (a 8.9 MB Q4_0 matvec), keep the best few, and compute
+    // exact logits only for the tokens those clusters hold plus a fixed high-frequency
+    // set. The target head stays dense, so verification - and therefore the output - is
+    // unchanged; a rejected draft costs no more than it did before.
+    ggml_tensor * fh_ids = nullptr;
+    if (model.flashhead_centroids && head_w == model.output && loras->empty() && cur->ne[1] == 1) {
+        const char * env_p = getenv("LLAMA_FLASHHEAD_PROBES");
+        int n_probes = env_p ? atoi(env_p) : 256;
+        n_probes = std::min<int>(std::max(n_probes, 1), model.flashhead_centroids->ne[1]);
+
+        ggml_tensor * cscore = ggml_mul_mat(ctx0, model.flashhead_centroids, cur);   // [n_clusters, 1]
+        cb(cscore, "flashhead_centroid_logits", -1);
+
+        ggml_tensor * sel = ggml_top_k(ctx0, cscore, n_probes);                      // I32 [p, 1]
+        ggml_tensor * cand = ggml_get_rows(ctx0, model.flashhead_c2t, sel);          // I32 [b, p, 1]
+        cand = ggml_reshape_1d(ctx0, cand, ggml_nelements(cand));
+
+        fh_ids = ggml_concat(ctx0, cand, model.flashhead_static, 0);
+        cb(fh_ids, "flashhead_ids", -1);
+
+        ggml_tensor * narrow = ggml_mul_mat_rows(ctx0, head_w, cur, fh_ids);   // [n_ids, 1]
+        cb(narrow, "flashhead_narrow_logits", -1);
+
+        // Scatter back to the full vocabulary on the GPU rather than on the host: a
+        // host-side scatter needs the id list read back, which forces a synchronize
+        // per drafted token and serialises the pipeline. Viewing the logits as
+        // [1, n_vocab] makes every vocabulary entry its own "row", so set_rows places
+        // each retrieved logit at its own token id. Everything else keeps the floor
+        // and can never be sampled.
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, model.output->ne[1]), -10000.0f);
+        full = ggml_set_rows(ctx0, full, ggml_reshape_2d(ctx0, narrow, 1, ggml_nelements(fh_ids)), fh_ids);
+        cur  = ggml_reshape_2d(ctx0, full, model.output->ne[1], 1);
+    } else {
+        cur = build_lora_mm(head_w, cur);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

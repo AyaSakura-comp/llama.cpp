@@ -583,6 +583,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_MAT_ROWS,
+
         GGML_OP_COUNT,
     };
 
@@ -1429,6 +1431,17 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
+
+    // matrix multiplication against a subset of a's rows
+    //   a: [k, m] (may be quantised), b: [k, n], ids: I32 [r]
+    //   result: [r, n], result[j, i] = dot(a_row[ids[j]], b_col[i])
+    // Only the rows named by ids are read, which is the point: for a vocabulary
+    // projection r is a few thousand out of a few hundred thousand.
+    GGML_API struct ggml_tensor * ggml_mul_mat_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(

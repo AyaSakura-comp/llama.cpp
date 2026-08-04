@@ -530,6 +530,13 @@ struct llama_model {
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+
+    // FlashHead: a two-stage retrieval replacement for the dense vocabulary
+    // projection. Present only in models exported with the flashhead tensors; when
+    // any of them is missing the graph falls back to the full dense head.
+    struct ggml_tensor * flashhead_centroids = nullptr; // [n_embd, n_clusters] Q4_0
+    struct ggml_tensor * flashhead_c2t       = nullptr; // [cluster_size, n_clusters] I32
+    struct ggml_tensor * flashhead_static    = nullptr; // [n_static] I32
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
