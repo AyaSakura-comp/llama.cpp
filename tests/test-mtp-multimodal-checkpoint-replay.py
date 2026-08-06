@@ -8,11 +8,13 @@ second appends a new image and must complete without restarting llama-server.
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -63,11 +65,27 @@ def main() -> int:
             text=True,
         ).strip()
 
+        journal_since = datetime.now().astimezone().isoformat()
         append = subprocess.run(
             base + ["-p", f"@{args.image}", "Diagnostic appended image: reply exactly OK."],
             text=True, capture_output=True, timeout=180,
         )
         assert append.returncode == 0, append.stderr or append.stdout
+
+        journal = subprocess.check_output(
+            [
+                "journalctl", "-u", "qwen-mtp.service", "--since", journal_since,
+                "--no-pager", "-o", "cat",
+            ],
+            text=True,
+        )
+        generated = [
+            int(match.group(1))
+            for match in re.finditer(r"#gen drafts = (\d+)", journal)
+        ]
+        assert any(count > 0 for count in generated), (
+            "multimodal continuation completed without MTP drafts\n" + journal
+        )
 
         pid_after = subprocess.check_output(
             ["systemctl", "show", "-p", "MainPID", "--value", "qwen-mtp.service"],

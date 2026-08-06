@@ -246,10 +246,7 @@ struct server_slot {
     bool is_mtp() const { return is_mtp_enabled; }
 
     bool can_speculate() const {
-        // MTP draft graphs require both a token id and a target hidden-state row.
-        // Media chunks provide embeddings without token ids, so keep MTP disabled
-        // for the entire multimodal request until that pairing is implemented.
-        return !!spec && task && !task->tokens.has_media();
+        return !!spec;
     }
 
     // MTP keeps every prompt row as an output so recurrent batching and the
@@ -2265,7 +2262,14 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (slot.is_mtp() && slot.task->tokens.has_media()) {
+                    // Until the MTP graph can consume image embeddings as its token
+                    // input, keep media drafts to one token. This still overlaps one
+                    // draft with target verification without entering the unstable
+                    // autoregressive draft loop over a media-gapped KV cache.
+                    n_draft_max = std::min(n_draft_max, 1);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -2730,11 +2734,17 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft && slot.can_speculate()) {
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
-                            if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
-                            }
+                        // The MTP graph cannot consume media embeddings as its discrete
+                        // next-token input. Skip those draft KV rows and carry the
+                        // target's final media hidden state into the following text.
+                        // The next text token must pair with the target's final media
+                        // hidden row rather than with the row preceding the media chunk.
+                        if (slot.is_mtp() && slot.can_speculate() &&
+                            !common_speculative_sync_target_hidden(spec.get(), slot.id, -1)) {
+                            SLT_ERR(slot, "%s", "failed to synchronize MTP state after media\n");
+                            send_error(slot, "failed to synchronize MTP state after media", ERROR_TYPE_SERVER);
+                            slot.release();
+                            continue;
                         }
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
@@ -2887,7 +2897,9 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            // MTP requires pre-norm hidden rows (enabled independently by the
+            // speculative implementation), not the public embedding output.
+            llama_set_embeddings(ctx_tgt, slot_batched->task->need_embd());
         }
 
         if (batch.n_tokens == 0) {
@@ -2907,7 +2919,7 @@ private:
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
             bool mtp_prefill_only =
-                slot_batched && slot_batched->is_mtp() && slot_batched->task && !slot_batched->task->tokens.has_media();
+                slot_batched && slot_batched->is_mtp() && slot_batched->task;
             bool mtp_prefill_final = false;
             llama_seq_id mtp_prefill_seq = -1;
             for (int32_t k = i; mtp_prefill_only && k < i + n_tokens; ++k) {
@@ -2922,9 +2934,13 @@ private:
                     batch.n_seq_id[k] == 1 &&
                     seq_id == mtp_prefill_seq &&
                     it != slots.end() && it->task &&
-                    batch.pos[k] < it->task->n_tokens();
+                    it->state != SLOT_STATE_GENERATING;
                 if (mtp_prefill_only) {
-                    mtp_prefill_final |= batch.pos[k] == it->task->n_tokens() - 1;
+                    // Multimodal M-RoPE positions are not comparable with the
+                    // logical prompt token count. The slot records the actual
+                    // final batch row selected for sampling.
+                    mtp_prefill_final |=
+                        it->state == SLOT_STATE_DONE_PROMPT && it->i_batch == k;
                 }
             }
             llama_set_mtp_prefill_logits_last(ctx_tgt, mtp_prefill_only);

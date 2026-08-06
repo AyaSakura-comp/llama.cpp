@@ -142,6 +142,10 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    virtual bool sync_target_hidden(llama_seq_id /*seq_id*/, int32_t /*i_batch*/) {
+        return true;
+    }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted) = 0;
@@ -528,6 +532,20 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
         }
 
+        return true;
+    }
+
+    bool sync_target_hidden(llama_seq_id seq_id, int32_t i_batch) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) pending_h.size());
+
+        const float * h_last = llama_get_embeddings_pre_norm_ith(params.ctx_tgt, i_batch);
+        if (h_last == nullptr) {
+            LOG_ERR("%s: target hidden row %d is unavailable for seq_id %d\n",
+                    __func__, i_batch, seq_id);
+            return false;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), h_last, (size_t) n_embd * sizeof(float));
         return true;
     }
 
@@ -1317,6 +1335,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_sync_target_hidden(common_speculative * spec, llama_seq_id seq_id, int32_t i_batch) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->sync_target_hidden(seq_id, i_batch);
     }
 
     return result;

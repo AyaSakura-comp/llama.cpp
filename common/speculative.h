@@ -53,6 +53,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// update speculative state from the final target hidden row after a media chunk
+// that cannot be evaluated directly by the draft context
+bool common_speculative_sync_target_hidden(common_speculative * spec, llama_seq_id seq_id, int32_t i_batch);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
