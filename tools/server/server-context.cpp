@@ -197,7 +197,7 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        if (spec) {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -245,12 +245,19 @@ struct server_slot {
 
     bool is_mtp() const { return is_mtp_enabled; }
 
+    bool can_speculate() const {
+        // MTP draft graphs require both a token id and a target hidden-state row.
+        // Media chunks provide embeddings without token ids, so keep MTP disabled
+        // for the entire multimodal request until that pairing is implemented.
+        return !!spec && task && !task->tokens.has_media();
+    }
+
     // MTP keeps every prompt row as an output so recurrent batching and the
     // pre-norm hidden-state stream remain identical to the established path.
     // The Qwen graph independently narrows the LM head to its final row.
     bool need_embd() const {
         GGML_ASSERT(task);
-        return task->need_embd() || is_mtp();
+        return task->need_embd() || (is_mtp() && can_speculate());
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -267,7 +274,9 @@ struct server_slot {
     bool can_batch_with(server_slot & other_slot) const {
         GGML_ASSERT(task);
 
-        return task->type == other_slot.task->type && are_lora_equal(lora, other_slot.lora);
+        return task->type == other_slot.task->type &&
+               can_speculate() == other_slot.can_speculate() &&
+               are_lora_equal(lora, other_slot.lora);
     }
 
     bool has_budget(const common_params & global_params) {
@@ -290,10 +299,6 @@ struct server_slot {
 
     bool is_processing() const {
         return state != SLOT_STATE_IDLE;
-    }
-
-    bool can_speculate() const {
-        return !!spec;
     }
 
     void add_token(const completion_token_output & token) {
@@ -2725,10 +2730,7 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft) {
-                            // TODO: in the future, figure out how to infuse target embeddings to the images
-                            //       for now, we skip this for simplicity
-                            //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+                        if (ctx_dft && slot.can_speculate()) {
                             res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
@@ -3039,7 +3041,19 @@ private:
             //        }
             //    }
             //}
-            if (!common_speculative_process(spec.get(), batch_view)) {
+            bool process_speculative_batch = false;
+            for (int32_t k = 0; k < batch_view.n_tokens && !process_speculative_batch; ++k) {
+                for (int32_t s = 0; s < batch_view.n_seq_id[k]; ++s) {
+                    const llama_seq_id seq_id = batch_view.seq_id[k][s];
+                    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) slots.size());
+                    process_speculative_batch = slots[seq_id].can_speculate();
+                    if (process_speculative_batch) {
+                        break;
+                    }
+                }
+            }
+
+            if (process_speculative_batch && !common_speculative_process(spec.get(), batch_view)) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
