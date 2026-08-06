@@ -2262,14 +2262,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                int n_draft_max = slot.get_n_draft_max();
-                if (slot.is_mtp() && slot.task->tokens.has_media()) {
-                    // Until the MTP graph can consume image embeddings as its token
-                    // input, keep media drafts to one token. This still overlaps one
-                    // draft with target verification without entering the unstable
-                    // autoregressive draft loop over a media-gapped KV cache.
-                    n_draft_max = std::min(n_draft_max, 1);
-                }
+                const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
