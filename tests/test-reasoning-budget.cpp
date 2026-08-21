@@ -184,6 +184,39 @@ static void test_reasoning_budget_clone_mid_forcing() {
     llama_sampler_free(sampler);
 }
 
+static void test_reasoning_budget_eog_while_counting_forces_end() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 32, REASONING_BUDGET_COUNTING);
+
+    // A null-vocab sampler treats LLAMA_TOKEN_NULL as its synthetic EOG token.
+    // When EOG is the model's highest-logit choice inside a reasoning block,
+    // the sampler must close the block instead of allowing an empty final answer.
+    std::vector<llama_token_data> cur = {
+        {LLAMA_TOKEN_NULL, 10.0f, 0.0f},
+        {50,                9.0f, 0.0f},
+        {101,               1.0f, 0.0f},
+        {102,               0.0f, 0.0f},
+    };
+    llama_token_data_array cur_p = {cur.data(), cur.size(), -1, false};
+    llama_sampler_apply(sampler, &cur_p);
+
+    size_t finite_count = 0;
+    llama_token finite_token = LLAMA_TOKEN_NULL;
+    for (const auto & candidate : cur) {
+        if (std::isfinite(candidate.logit)) {
+            finite_count++;
+            finite_token = candidate.id;
+        }
+    }
+
+    GGML_ASSERT(finite_count == 1 && finite_token == 102 && "EOG inside reasoning did not force the end sequence");
+
+    llama_sampler_free(sampler);
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -312,8 +345,9 @@ int main(void) {
 
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
+    test_reasoning_budget_eog_while_counting_forces_end();
 
-    printf("OK (8 tests passed)\n");
+    printf("OK (9 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

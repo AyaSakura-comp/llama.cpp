@@ -4,9 +4,11 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct token_matcher {
@@ -42,6 +44,7 @@ struct common_reasoning_budget_ctx {
     token_matcher start_matcher;
     token_matcher end_matcher;
     std::vector<llama_token> forced_tokens;
+    std::vector<llama_token> eog_tokens;
 
     int32_t budget;           // maximum tokens in reasoning block
     int32_t remaining;        // tokens remaining in budget
@@ -140,15 +143,42 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
     }
 }
 
+static bool common_reasoning_budget_is_eog(
+        const common_reasoning_budget_ctx * ctx, llama_token token) {
+    return std::find(ctx->eog_tokens.begin(), ctx->eog_tokens.end(), token) != ctx->eog_tokens.end();
+}
+
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
-    if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
-        return;
+    if (ctx->state == REASONING_BUDGET_COUNTING && !ctx->forced_tokens.empty() && cur_p->size > 0) {
+        size_t best = 0;
+        for (size_t i = 1; i < cur_p->size; i++) {
+            if (cur_p->data[i].logit > cur_p->data[best].logit) {
+                best = i;
+            }
+        }
+
+        if (common_reasoning_budget_is_eog(ctx, cur_p->data[best].id)) {
+            // The model is trying to terminate while it is still inside the
+            // reasoning block. Close the block first so parsers do not return
+            // a reasoning-only response and lose a tool call or final answer.
+            ctx->state = REASONING_BUDGET_FORCING;
+            ctx->force_pos = 0;
+            ctx->end_matcher.reset();
+            LOG_INF("reasoning-budget: EOG selected while reasoning, forcing end sequence\n");
+        } else {
+            // Sampling may select a non-argmax EOG. Suppress all known EOG
+            // tokens until the model emits the reasoning end tag naturally.
+            for (size_t i = 0; i < cur_p->size; i++) {
+                if (common_reasoning_budget_is_eog(ctx, cur_p->data[i].id)) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            }
+        }
     }
 
-    if (ctx->force_pos >= ctx->forced_tokens.size()) {
+    if (ctx->state != REASONING_BUDGET_FORCING || ctx->force_pos >= ctx->forced_tokens.size()) {
         return;
     }
 
@@ -216,6 +246,19 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         initial_state = REASONING_BUDGET_FORCING;
     }
 
+    std::vector<llama_token> eog_tokens;
+    if (vocab == nullptr) {
+        // Unit tests use LLAMA_TOKEN_NULL as a synthetic EOG token.
+        eog_tokens.push_back(LLAMA_TOKEN_NULL);
+    } else {
+        for (const llama_token token : {llama_vocab_eos(vocab), llama_vocab_eot(vocab)}) {
+            if (token != LLAMA_TOKEN_NULL &&
+                std::find(eog_tokens.begin(), eog_tokens.end(), token) == eog_tokens.end()) {
+                eog_tokens.push_back(token);
+            }
+        }
+    }
+
     return llama_sampler_init(
         /* .iface = */ &common_reasoning_budget_i,
         /* .ctx   = */ new common_reasoning_budget_ctx {
@@ -223,6 +266,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .start_matcher = */ { start_tokens, 0 },
             /* .end_matcher   = */ { end_tokens, 0 },
             /* .forced_tokens = */ forced_tokens,
+            /* .eog_tokens    = */ std::move(eog_tokens),
             /* .budget        = */ budget,
             /* .remaining     = */ budget,
             /* .state         = */ initial_state,
