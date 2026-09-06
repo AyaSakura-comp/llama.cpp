@@ -103,6 +103,12 @@ must remain absent in default production.
   248,320-logit vector for every prompt position.
 - Speculative draft quality affects acceptance and speed. With a dense target, it
   must not change the target probability distribution.
+- **Dual-Track Slot Save/Restore (`ctx_tgt` & `ctx_dft`):** Slot snapshots (`/slots/:id?action=save|restore`)
+  must persist both `ctx_tgt` (`.bin`) and `ctx_dft` (`.bin.dft`). Without draft state synchronization,
+  subsequent multi-turn continuations or restored sessions cause M-RoPE position divergence and `GGML_ABORT`
+  in `ctx_dft` decode. On restore, tokens beyond `pos_max` are safely pruned via `llama_memory_seq_rm`.
+- **Hybrid / Recurrent Memory Checkpoint Retention:** In models with recurrent state (`COMMON_CONTEXT_SEQ_RM_TYPE_FULL`),
+  checkpoints restored with valid prompt tokens are protected against premature memory purge on non-zero `p0`.
 
 ### FlashHead
 
