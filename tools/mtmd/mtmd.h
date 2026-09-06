@@ -177,6 +177,21 @@ MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk);
 MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 
+// metadata-only chunk reconstruction for KV cache serialization/restoration
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_init_image_meta(
+    const char * id,
+    uint32_t     nx,
+    uint32_t     ny,
+    int          pos_type,
+    uint32_t     image_idx);
+
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_init_audio_meta(
+    const char * id,
+    uint32_t     n_tokens);
+
+MTMD_API int      mtmd_image_tokens_get_pos_type (const mtmd_image_tokens * image_tokens);
+MTMD_API uint32_t mtmd_image_tokens_get_image_idx(const mtmd_image_tokens * image_tokens);
+
 
 // mtmd_image_tokens
 //

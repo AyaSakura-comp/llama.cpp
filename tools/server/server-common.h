@@ -177,6 +177,7 @@ public:
     size_t size_up_to_pos(llama_pos max_pos) const;
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
+    const mtmd::input_chunk_ptr * find_chunk_ptr(size_t idx) const;
 
     void push_back(llama_token tok);
 
@@ -202,6 +203,14 @@ public:
     bool empty() const { return tokens.empty(); }
 
     bool has_media() const { return !map_idx_to_media.empty(); }
+
+    const std::map<size_t, mtmd::input_chunk_ptr> & get_media_map() const {
+        return map_idx_to_media;
+    }
+
+    void set_media_chunk(size_t idx, mtmd_input_chunk * chunk) {
+        map_idx_to_media[idx] = mtmd::input_chunk_ptr(chunk);
+    }
 
     void clear() {
         map_idx_to_media.clear();

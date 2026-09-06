@@ -22,6 +22,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <fstream>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -157,6 +158,7 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+        prompt.checkpoints.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -712,14 +714,22 @@ private:
 
         params_base = params;
 
+        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end();
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
 
-        if (model_tgt == nullptr) {
+        if (model_tgt == nullptr || ctx_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (spec_mtp) {
+            llama_set_mtp_dynamic_pp(ctx_tgt, true);
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -759,14 +769,14 @@ private:
 
             auto cparams = common_context_params_to_llama(params_dft);
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (spec_mtp && ctx_dft) {
+                llama_set_mtp_dynamic_pp(ctx_dft.get(), true);
+            }
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
@@ -785,6 +795,7 @@ private:
                 SRV_ERR("%s", "failed to create MTP context\n");
                 return false;
             }
+            llama_set_mtp_dynamic_pp(ctx_dft.get(), true);
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
@@ -1982,10 +1993,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2008,6 +2015,35 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    if (slot->prompt.tokens.has_media()) {
+                        json media_meta = json::array();
+                        for (const auto & it : slot->prompt.tokens.get_media_map()) {
+                            const size_t idx = it.first;
+                            const auto & chunk = it.second;
+                            if (!chunk) continue;
+                            json entry;
+                            entry["idx"] = idx;
+                            entry["type"] = (int)mtmd_input_chunk_get_type(chunk.get());
+                            const char * cid = mtmd_input_chunk_get_id(chunk.get());
+                            entry["id"] = cid ? std::string(cid) : "";
+                            entry["n_tokens"] = mtmd_input_chunk_get_n_tokens(chunk.get());
+                            entry["n_pos"] = (int64_t)mtmd_input_chunk_get_n_pos(chunk.get());
+                            const auto * img_tok = mtmd_input_chunk_get_tokens_image(chunk.get());
+                            if (img_tok) {
+                                entry["nx"] = (uint32_t)mtmd_image_tokens_get_nx(img_tok);
+                                entry["ny"] = (uint32_t)mtmd_image_tokens_get_ny(img_tok);
+                                entry["pos_type"] = mtmd_image_tokens_get_pos_type(img_tok);
+                                entry["image_idx"] = mtmd_image_tokens_get_image_idx(img_tok);
+                            }
+                            media_meta.push_back(entry);
+                        }
+                        std::ofstream ofs(filepath + ".media.json");
+                        if (ofs.is_open()) {
+                            ofs << media_meta.dump(2);
+                            ofs.close();
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2023,7 +2059,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2054,6 +2089,38 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->prompt.checkpoints.clear();
+
+                    std::ifstream ifs(filepath + ".media.json");
+                    if (ifs.is_open()) {
+                        try {
+                            json media_meta;
+                            ifs >> media_meta;
+                            if (media_meta.is_array()) {
+                                for (const auto & entry : media_meta) {
+                                    size_t idx = entry.value("idx", (size_t)0);
+                                    int type = entry.value("type", (int)MTMD_INPUT_CHUNK_TYPE_IMAGE);
+                                    std::string id = entry.value("id", "");
+                                    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                                        uint32_t nx = entry.value("nx", (uint32_t)0);
+                                        uint32_t ny = entry.value("ny", (uint32_t)0);
+                                        int pos_type = entry.value("pos_type", 0);
+                                        uint32_t image_idx = entry.value("image_idx", (uint32_t)0);
+                                        mtmd_input_chunk * chunk = mtmd_input_chunk_init_image_meta(
+                                            id.c_str(), nx, ny, pos_type, image_idx);
+                                        slot->prompt.tokens.set_media_chunk(idx, chunk);
+                                    } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                                        uint32_t n_tok = entry.value("n_tokens", (uint32_t)0);
+                                        mtmd_input_chunk * chunk = mtmd_input_chunk_init_audio_meta(
+                                            id.c_str(), n_tok);
+                                        slot->prompt.tokens.set_media_chunk(idx, chunk);
+                                    }
+                                }
+                            }
+                        } catch (const std::exception & e) {
+                            SRV_WRN("failed to parse media metadata from %s: %s\n", (filepath + ".media.json").c_str(), e.what());
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2070,9 +2137,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {

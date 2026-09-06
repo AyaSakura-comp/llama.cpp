@@ -344,6 +344,14 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+const mtmd::input_chunk_ptr * server_tokens::find_chunk_ptr(size_t idx) const {
+    auto it = map_idx_to_media.find(idx);
+    if (it != map_idx_to_media.end()) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
 void server_tokens::push_back(llama_token tok) {
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");
@@ -395,7 +403,6 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
     return tokens;
 }
 
@@ -479,18 +486,26 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
         const llama_token bi = b.tokens[i];
 
         if (ai == LLAMA_TOKEN_NULL && bi == LLAMA_TOKEN_NULL) {
-            const auto & a_chunk =   find_chunk(i);
-            const auto & b_chunk = b.find_chunk(i);
+            const auto * a_chunk_ptr =   find_chunk_ptr(i);
+            const auto * b_chunk_ptr = b.find_chunk_ptr(i);
 
-            GGML_ASSERT(a_chunk && b_chunk);
+            if (!a_chunk_ptr || !b_chunk_ptr || !*a_chunk_ptr || !*b_chunk_ptr) {
+                return i;
+            }
 
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+            const auto & a_chunk = *a_chunk_ptr;
+            const auto & b_chunk = *b_chunk_ptr;
+
+            const char * id_ai_c = mtmd_input_chunk_get_id(a_chunk.get());
+            const char * id_bi_c = mtmd_input_chunk_get_id(b_chunk.get());
+
+            const std::string id_ai = id_ai_c ? id_ai_c : "";
+            const std::string id_bi = id_bi_c ? id_bi_c : "";
 
             const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
 
-            if (id_ai == id_bi && n_tok_a == n_tok_b) {
+            if (!id_ai.empty() && id_ai == id_bi && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;

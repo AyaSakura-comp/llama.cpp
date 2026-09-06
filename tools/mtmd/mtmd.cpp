@@ -1382,6 +1382,52 @@ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     }
 }
 
+int mtmd_image_tokens_get_pos_type(const mtmd_image_tokens * image_tokens) {
+    return (int)image_tokens->pos;
+}
+
+uint32_t mtmd_image_tokens_get_image_idx(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->image_idx;
+}
+
+mtmd_input_chunk * mtmd_input_chunk_init_image_meta(
+    const char * id,
+    uint32_t     nx,
+    uint32_t     ny,
+    int          pos_type,
+    uint32_t     image_idx) {
+    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+    image_tokens->nx        = nx;
+    image_tokens->ny        = ny;
+    image_tokens->pos       = (mtmd_pos_type)pos_type;
+    image_tokens->image_idx = image_idx;
+    if (id) {
+        image_tokens->id = id;
+    }
+    return new mtmd_input_chunk{
+        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+        {},
+        std::move(image_tokens),
+        nullptr,
+    };
+}
+
+mtmd_input_chunk * mtmd_input_chunk_init_audio_meta(
+    const char * id,
+    uint32_t     n_tokens) {
+    mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+    audio_tokens->n_tokens = n_tokens;
+    if (id) {
+        audio_tokens->id = id;
+    }
+    return new mtmd_input_chunk{
+        MTMD_INPUT_CHUNK_TYPE_AUDIO,
+        {},
+        nullptr,
+        std::move(audio_tokens),
+    };
+}
+
 // test function
 
 mtmd_input_chunks * mtmd_test_create_input_chunks() {
