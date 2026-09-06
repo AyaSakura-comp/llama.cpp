@@ -3359,6 +3359,8 @@ private:
                     // TODO: set result.probs
 
                     if (!process_token(result, slot)) {
+                        slot.prompt.tokens.push_back(ids.back());
+
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);

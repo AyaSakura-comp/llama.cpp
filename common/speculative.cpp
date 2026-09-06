@@ -561,10 +561,17 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const auto * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+
+            if (llama_vocab_is_eog(vocab_dft, dp.id_last)) {
+                dp.drafting = false;
                 continue;
             }
 
@@ -618,7 +625,8 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if ((params.n_max <= (int) result.size()) ||
+                if (llama_vocab_is_eog(vocab_dft, id) ||
+                    (params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
