@@ -103,6 +103,10 @@ LLAMA_API void llama_set_mtp_prefill_logits_last(struct llama_context * ctx, boo
 // Skip the LM head for a prompt chunk that does not contain the request's final prompt row.
 LLAMA_API void llama_set_mtp_prefill_logits_skip(struct llama_context * ctx, bool value);
 
+// Keep only the token-generation reserve while idle and grow prompt-processing
+// buffers to the actual MTP prompt length on first use.
+LLAMA_API void llama_set_mtp_dynamic_pp(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);

@@ -113,6 +113,7 @@ struct llama_context {
     void set_embeddings_pre_norm(bool value);
     void set_mtp_prefill_logits_last(bool value);
     void set_mtp_prefill_logits_skip(bool value);
+    void set_mtp_dynamic_pp(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -243,7 +244,8 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
+        bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 

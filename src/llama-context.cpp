@@ -61,6 +61,7 @@ llama_context::llama_context(
     cparams.embeddings_pre_norm = false;
     cparams.mtp_prefill_logits_last = false;
     cparams.mtp_prefill_logits_skip = false;
+    cparams.mtp_dynamic_pp = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -570,8 +571,14 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
+    // MTP target and draft contexts otherwise each retain a worst-case
+    // n_ctx-by-n_ubatch attention mask while idle. Their prompt graphs are
+    // allowed to grow to the actual prompt length on first use; the TG graph
+    // remains pre-reserved so decode never starts from an empty scheduler.
+    const bool dynamic_mtp_pp = cparams.mtp_dynamic_pp;
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
-    {
+    if (!dynamic_mtp_pp) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
@@ -602,7 +609,7 @@ void llama_context::sched_reserve() {
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-    {
+    if (!dynamic_mtp_pp) {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
@@ -611,6 +618,9 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+    } else {
+        n_splits_pp = n_splits_tg;
+        n_nodes_pp  = n_nodes_tg;
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1106,6 +1116,16 @@ void llama_context::set_mtp_prefill_logits_last(bool value) {
 
 void llama_context::set_mtp_prefill_logits_skip(bool value) {
     cparams.mtp_prefill_logits_skip = value;
+}
+
+void llama_context::set_mtp_dynamic_pp(bool value) {
+    if (cparams.mtp_dynamic_pp == value) {
+        return;
+    }
+
+    cparams.mtp_dynamic_pp = value;
+    sched_need_reserve = true;
+    sched_reserve();
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2236,7 +2256,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
+        bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3605,6 +3626,10 @@ void llama_set_mtp_prefill_logits_last(llama_context * ctx, bool value) {
 
 void llama_set_mtp_prefill_logits_skip(llama_context * ctx, bool value) {
     ctx->set_mtp_prefill_logits_skip(value);
+}
+
+void llama_set_mtp_dynamic_pp(llama_context * ctx, bool value) {
+    ctx->set_mtp_dynamic_pp(value);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {
