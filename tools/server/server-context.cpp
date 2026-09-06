@@ -109,6 +109,8 @@ struct server_slot {
 
     std::string stopping_word;
 
+    std::string snapshot_filename;
+
     // state
     slot_state state = SLOT_STATE_IDLE;
 
@@ -469,10 +471,12 @@ struct server_slot {
         json res;
 
         res = {
-            {"id",            id},
-            {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
-            {"is_processing", is_processing()},
+            {"id",                id},
+            {"n_ctx",             n_ctx},
+            {"speculative",       can_speculate()},
+            {"is_processing",     is_processing()},
+            {"snapshot_filename", snapshot_filename},
+            {"t_last_used",       t_last_used},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -2044,6 +2048,9 @@ private:
                         }
                     }
 
+                    slot->snapshot_filename = filename;
+                    slot->t_last_used = ggml_time_us();
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2090,6 +2097,8 @@ private:
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
                     slot->prompt.checkpoints.clear();
+                    slot->snapshot_filename = filename;
+                    slot->t_last_used = ggml_time_us();
 
                     std::ifstream ifs(filepath + ".media.json");
                     if (ifs.is_open()) {
@@ -2154,6 +2163,8 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear(false);
+                    slot->snapshot_filename.clear();
+                    slot->t_last_used = -1;
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
