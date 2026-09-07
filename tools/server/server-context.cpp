@@ -2110,10 +2110,6 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
-                    slot->prompt.checkpoints.clear();
-                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-                        create_checkpoint(*slot, 0, 0, token_count - 1);
-                    }
                     slot->snapshot_filename = filename;
                     slot->t_last_used = ggml_time_us();
 
@@ -2146,6 +2142,12 @@ private:
                         } catch (const std::exception & e) {
                             SRV_WRN("failed to parse media metadata from %s: %s\n", (filepath + ".media.json").c_str(), e.what());
                         }
+                    }
+
+                    slot->prompt.checkpoints.clear();
+                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+                        const llama_pos pos_max = std::max(0, slot->prompt.tokens.pos_next() - 1);
+                        create_checkpoint(*slot, 0, 0, pos_max);
                     }
 
                     const int64_t t_end = ggml_time_us();
