@@ -2049,6 +2049,8 @@ private:
                             ofs << media_meta.dump(2);
                             ofs.close();
                         }
+                    } else {
+                        std::remove((filepath + ".media.json").c_str());
                     }
 
                     slot->snapshot_filename = filename;
@@ -2121,6 +2123,10 @@ private:
                             if (media_meta.is_array()) {
                                 for (const auto & entry : media_meta) {
                                     size_t idx = entry.value("idx", (size_t)0);
+                                    if (idx >= tokens.size()) {
+                                        SRV_WRN("ignoring out-of-bounds media chunk at idx %zu (tokens.size() = %zu)\n", idx, tokens.size());
+                                        continue;
+                                    }
                                     int type = entry.value("type", (int)MTMD_INPUT_CHUNK_TYPE_IMAGE);
                                     std::string id = entry.value("id", "");
                                     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
@@ -2146,7 +2152,9 @@ private:
 
                     slot->prompt.checkpoints.clear();
                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-                        const llama_pos pos_max = std::max(0, slot->prompt.tokens.pos_next() - 1);
+                        const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        const llama_pos pos_max_tok = slot->prompt.tokens.empty() ? 0 : slot->prompt.tokens.pos_next() - 1;
+                        const llama_pos pos_max = std::max((llama_pos)0, std::max(pos_max_mem, pos_max_tok));
                         create_checkpoint(*slot, 0, 0, pos_max);
                     }
 
@@ -2645,8 +2653,8 @@ private:
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
-                                    const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np0 = std::max<int>(n_past - 10, 0);
+                                    const int np1 = std::min<int>(n_past + 10, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -2661,6 +2669,8 @@ private:
                                         if (i == n_past) {
                                             ss0 << " | ";
                                             ss1 << " | ";
+                                            st0 << " | ";
+                                            st1 << " | ";
                                         }
 
                                         {
@@ -2678,11 +2688,12 @@ private:
                                         }
                                     }
 
-                                    SLT_WRN(slot, "%s\n", ss0.str().c_str());
-                                    SLT_WRN(slot, "%s\n", ss1.str().c_str());
+                                    SLT_DBG(slot, "MISMATCH DEBUG at n_past = %d:\n", n_past);
+                                    SLT_DBG(slot, "%s\n", ss0.str().c_str());
+                                    SLT_DBG(slot, "%s\n", ss1.str().c_str());
 
-                                    SLT_WRN(slot, "%s\n", st0.str().c_str());
-                                    SLT_WRN(slot, "%s\n", st1.str().c_str());
+                                    SLT_DBG(slot, "%s\n", st0.str().c_str());
+                                    SLT_DBG(slot, "%s\n", st1.str().c_str());
                                 }
 
                                 if (pos_min >= pos_min_thold) {

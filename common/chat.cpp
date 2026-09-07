@@ -631,6 +631,50 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
                            "{%- if false %}");
     }
 
+    // Patch Qwen chat template bug: when preserve_thinking is true, empty or absent reasoning
+    // injects spurious <think>\n\n</think>\n\n tags, causing token divergence and full KV cache wipe.
+    auto patch_qwen_preserve_thinking = [](std::string & src) {
+        if (src.find("preserve_thinking") == std::string::npos ||
+            src.find("reasoning_content = reasoning_content|trim") == std::string::npos) {
+            return;
+        }
+
+        const std::string qwen_target =
+            "        {%- set reasoning_content = reasoning_content|trim %}\n"
+            "        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}\n"
+            "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n"
+            "        {%- else %}\n"
+            "            {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
+            "        {%- endif %}";
+
+        const std::string qwen_fix =
+            "        {%- set has_thinking = false %}\n"
+            "        {%- if message.reasoning_content is string and message.reasoning_content|trim %}\n"
+            "            {%- set has_thinking = true %}\n"
+            "        {%- elif content is string and (\"</think>\" in content or \"<think>\" in content) %}\n"
+            "            {%- set has_thinking = true %}\n"
+            "        {%- endif %}\n"
+            "        {%- set reasoning_content = reasoning_content|trim %}\n"
+            "        {%- if has_thinking and ((preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)) %}\n"
+            "            {%- if reasoning_content %}\n"
+            "                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n"
+            "            {%- else %}\n"
+            "                {{- '<|im_start|>' + message.role + '\\n<think>\\n</think>\\n\\n' + content }}\n"
+            "            {%- endif %}\n"
+            "        {%- else %}\n"
+            "            {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
+            "        {%- endif %}";
+
+        if (src.find(qwen_target) != std::string::npos) {
+            string_replace_all(src, qwen_target, qwen_fix);
+            LOG_INF("common_chat_templates_init: patched Qwen chat template preserve_thinking newline alignment\n");
+        }
+    };
+    patch_qwen_preserve_thinking(default_template_src);
+    if (!template_tool_use_src.empty()) {
+        patch_qwen_preserve_thinking(template_tool_use_src);
+    }
+
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;

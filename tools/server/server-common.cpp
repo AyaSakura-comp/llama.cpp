@@ -256,11 +256,14 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
         llama_pos res = tokens.size();
 
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
+            if (it->first >= tokens.size()) {
+                continue;
+            }
             const auto & chunk = it->second;
             res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
         }
 
-        return res;
+        return std::max((llama_pos)0, res);
     }
 
     int64_t idx = 0;

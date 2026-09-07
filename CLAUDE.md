@@ -224,10 +224,17 @@ what they do; the complete chronological ledger follows.
 - Added bounded replay after the media region, then enabled full configured MTP depth
   after safe checkpoint restoration.
 
+### 10. Qwen chat template preserve_thinking and slot checkpoint alignment
+
+- **Qwen Jinja template fix**: When `preserve_thinking: true`, empty or absent `reasoning_content` in assistant turns previously caused spurious `<think>\n\n</think>\n\n` tag emission (generating rogue token 271), diverging from the KV cache and causing full prompt re-evaluations. Added a `has_thinking` guard in `common/chat.cpp` to emit thinking tags only when actual reasoning tokens or tags are present.
+- **Multimodal metadata lifecycle**: In `tools/server/server-context.cpp`, saving text-only slots now removes stale `.media.json` sidecars, preventing obsolete image metadata from corrupting subsequent restores.
+- **Safe position bounds and checkpoint restoration**: In `tools/server/server-common.cpp` and `server-context.cpp`, out-of-bounds media entries (`idx >= tokens.size()`) are ignored, `pos_next()` is clamped to non-negative, and restored checkpoint `pos_max` is bounded by `llama_memory_seq_pos_max()` to prevent M-RoPE position divergence (`X < Y`).
+
 ## Active-branch commit ledger
 
 | Commit | Change |
 | --- | --- |
+| `4eb5733f8` | `fix(server): compute checkpoint pos_max after loading multimodal media chunks` |
 | `8a10ea94d` | `[verified] hip: tune K-quant MMQ tiles for RDNA 3.5` |
 | `5c39e48f2` | `[verified] hip: lower RDNA 3.5 Q4_K MMQ tile cap` |
 | `2d3f15e5b` | `[verified] mtp: skip unused Qwen prompt logits` |
