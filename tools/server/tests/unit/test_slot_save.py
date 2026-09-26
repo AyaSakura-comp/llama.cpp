@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from utils import *
 
@@ -68,6 +70,49 @@ def test_slot_save_restore():
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 1
+
+
+def test_slot_save_persists_context_checkpoints():
+    global server
+    server = ServerPreset.tinygemma3()
+    server.slot_save_path = "./tmp"
+    server.temperature = 0.0
+    server.n_predict = 1
+    server.start()
+
+    prompt = "Once upon a time " * 30
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+    assert original_prompt_n > 64
+
+    filename = "slot-checkpoints.bin"
+    checkpoint_path = Path(server.slot_save_path) / f"{filename}.ckpt"
+    checkpoint_path.unlink(missing_ok=True)
+
+    res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": filename,
+    })
+    assert res.status_code == 200
+    assert checkpoint_path.stat().st_size > 12
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": filename,
+    })
+    assert res.status_code == 200
+
+    modified_prompt = prompt.removesuffix("Once upon a time ") + "Once upon another time "
+    res = server.make_request("POST", "/completion", data={
+        "prompt": modified_prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] < original_prompt_n
 
 
 def test_slot_erase():
