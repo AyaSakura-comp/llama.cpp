@@ -453,7 +453,14 @@ if __name__ == '__main__':
                 for name, tensor in tensor_map.items():
                     assert tensor.A is not None
                     assert tensor.B is not None
-                    yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
+                    combined = cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B))
+                    # Adapter tensors bypass the base checkpoint loader, so apply
+                    # its architecture-specific naming/filtering before mapping.
+                    filtered = self.filter_tensors((name, lambda combined=combined: combined))
+                    if filtered is None:
+                        raise ValueError(f"Adapter tensor {name!r} is excluded by the base model filter")
+                    filtered_name, generate = filtered
+                    yield (filtered_name, generate())
 
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
                 dest = list(super().modify_tensors(data_torch, name, bid))

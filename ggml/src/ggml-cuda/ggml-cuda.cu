@@ -27,6 +27,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/hadamard.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -39,6 +40,8 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/rms-norm-quantize.cuh"
+#include "ggml-cuda/mul_mat_small_m.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -2592,6 +2595,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (!split && hint == GGML_HINT_SRC0_IS_HADAMARD && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (ggml_cuda_op_hadamard(ctx, src1, dst)) {
+            return;
+        }
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2653,6 +2663,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+    } else if (!split && ggml_cuda_supports_mul_mat_small_m(src0, src1, dst)) {
+        ggml_cuda_mul_mat_small_m(ctx, src0, src1, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
@@ -3732,6 +3744,107 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                concat->src[0]->ne[0] == weight->ne[0] - 1 && concat->src[1]->ne[0] == ssm_conv->ne[1];
     }
 
+    // RMS_NORM+MUL+{MUL_MAT,MUL_MAT_ID}: the terminal matmul changes shape, so ggml_can_fuse
+    // (which enforces same-shape across the whole sequence) would reject. Use
+    // ggml_can_fuse_subgraph with MUL and the matmul both as outputs — MUL may have additional
+    // consumers outside the subgraph (parallel Q/K/V projections, MoE gate + experts, or a
+    // graph-level embedding output). The fused kernel still materializes MUL's F32 output into
+    // its tensor so non-fused consumers keep working; we just reuse the quantized form for
+    // the specific matmul we're fusing with.
+    //
+    // Can be disabled by setting GGML_CUDA_FUSE_RMS_NORM_QUANTIZE=0.
+    {
+        static const bool fuse_rms_mm_enabled = []() {
+            const char * s = std::getenv("GGML_CUDA_FUSE_RMS_NORM_QUANTIZE");
+            return !s || (s[0] != '\0' && s[0] != '0');
+        }();
+        static const bool fuse_mmid_enabled = []() {
+            const char * s = std::getenv("GGML_CUDA_FUSE_RMS_NORM_QUANTIZE_MMID");
+            return !s || (s[0] != '\0' && s[0] != '0');
+        }();
+
+        const bool three_ops   = ops.size() == 3 &&
+                                 ops.begin()[0] == GGML_OP_RMS_NORM &&
+                                 ops.begin()[1] == GGML_OP_MUL;
+        const bool is_mm_mat   = three_ops && ops.begin()[2] == GGML_OP_MUL_MAT;
+        const bool is_mm_matid = three_ops && ops.begin()[2] == GGML_OP_MUL_MAT_ID && fuse_mmid_enabled;
+
+        if (fuse_rms_mm_enabled && (is_mm_mat || is_mm_matid)) {
+            if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1, node_idx + 2 })) {
+                return false;
+            }
+            const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+            const ggml_tensor * mul      = cgraph->nodes[node_idx+1];
+            const ggml_tensor * mm       = cgraph->nodes[node_idx+2];
+
+            GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+            GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+
+            if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+                return false;
+            }
+            if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+                return false;
+            }
+
+            if (mm->src[1] != mul) {
+                return false;  // Need MUL output to be src1 of MUL_MAT
+            }
+            if (mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+                return false;
+            }
+            // The fused kernel materializes MUL's F32 output assuming a contiguous layout
+            // matching rms_norm_f32's output convention. Reject non-contiguous MUL outputs.
+            if (!ggml_is_contiguous(mul)) {
+                return false;
+            }
+            if (!ggml_is_quantized(mm->src[0]->type)) {
+                return false;
+            }
+            if (ggml_backend_buft_is_cuda_split(mm->src[0]->buffer->buft)) {
+                return false;
+            }
+            // Mirror ggml_cuda_mul_mat's bad_padding_clear guard.
+            const bool bad_padding_clear = ggml_backend_buffer_get_usage(mm->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+                && ggml_nbytes(mm->src[0]) != ggml_backend_buffer_get_alloc_size(mm->src[0]->buffer, mm->src[0]) && mm->src[0]->view_src;
+            if (bad_padding_clear) {
+                return false;
+            }
+            // Blackwell native MXFP4 path uses a different activation layout; not supported here yet.
+            if (mm->src[0]->type == GGML_TYPE_MXFP4) {
+                return false;
+            }
+
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            // For MUL_MAT_ID the batch dimension is ne12 (n_tokens) and the expert dim is ne02;
+            // match ggml_cuda_mul_mat_id's dispatch rules.
+            const bool is_mmid  = mm->op == GGML_OP_MUL_MAT_ID;
+            const int64_t batch = is_mmid ? mm->src[1]->ne[2] : mm->src[1]->ne[1];
+            const int64_t n_ex  = is_mmid ? mm->src[0]->ne[2] : 0;
+            const bool use_vec_q = batch <= MMVQ_MAX_BATCH_SIZE &&
+                                   (!is_mmid || batch <= get_mmvq_mmid_max_batch(mm->src[0]->type, cc));
+            const bool use_q     = ggml_cuda_should_use_mmq(mm->src[0]->type, cc, batch, n_ex);
+            if (!use_vec_q && !use_q) {
+                return false;
+            }
+
+            // Row padding must match MATRIX_ROW_PADDING (enforced by the fused kernel's block layout).
+            if ((mm->src[1]->ne[0] % QK8_1) != 0) {
+                return false;
+            }
+
+            // MUL_MAT_ID with a quantized MMQ path expects ne13 == 1 (the existing MMQ path asserts this).
+            if (is_mmid && !use_vec_q && mm->src[1]->ne[3] != 1) {
+                return false;
+            }
+
+            return true;
+        }
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4393,6 +4506,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT }, {}) ||
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT_ID }, {})) {
+        ggml_cuda_op_rms_norm_mul_mat_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 

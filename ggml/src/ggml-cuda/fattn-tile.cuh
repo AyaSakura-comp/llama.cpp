@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-wmma-gfx1151.cuh"
 
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
@@ -591,13 +592,99 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 #endif // FAST_FP16_AVAILABLE
         }
 
+#if defined(__HIP_DEVICE_COMPILE__)
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#endif
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (cpw == 4 && cpy_ne == 4) {
 #pragma unroll
-        for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+                const int row = i_KQ_0 / (np*warp_size);
+                float & a0 = KQ_acc[row*4 + 0];
+                float & a1 = KQ_acc[row*4 + 1];
+                float & a2 = KQ_acc[row*4 + 2];
+                float & a3 = KQ_acc[row*4 + 3];
+
+                const half2 k0 = K_k[row][0];
+                const half2 k1 = K_k[row][1];
+                const half2 k2 = K_k[row][2];
+                const half2 k3 = K_k[row][3];
+
+                const half2 q0_0 = Q_k[0][0]; const half2 q1_0 = Q_k[1][0]; const half2 q2_0 = Q_k[2][0]; const half2 q3_0 = Q_k[3][0];
+                const half2 q0_1 = Q_k[0][1]; const half2 q1_1 = Q_k[1][1]; const half2 q2_1 = Q_k[2][1]; const half2 q3_1 = Q_k[3][1];
+                const half2 q0_2 = Q_k[0][2]; const half2 q1_2 = Q_k[1][2]; const half2 q2_2 = Q_k[2][2]; const half2 q3_2 = Q_k[3][2];
+                const half2 q0_3 = Q_k[0][3]; const half2 q1_3 = Q_k[1][3]; const half2 q2_3 = Q_k[2][3]; const half2 q3_3 = Q_k[3][3];
+
+                asm volatile(
+                    "v_dot2_f32_f16 %0, %4,  %8,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %4,  %9,  %1\n\t"
+                    "v_dot2_f32_f16 %2, %4, %10,  %2\n\t"
+                    "v_dot2_f32_f16 %3, %4, %11,  %3\n\t"
+                    "v_dot2_f32_f16 %0, %5, %12,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %5, %13,  %1\n\t"
+                    "v_dot2_f32_f16 %2, %5, %14,  %2\n\t"
+                    "v_dot2_f32_f16 %3, %5, %15,  %3\n\t"
+                    "v_dot2_f32_f16 %0, %6, %16,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %6, %17,  %1\n\t"
+                    "v_dot2_f32_f16 %2, %6, %18,  %2\n\t"
+                    "v_dot2_f32_f16 %3, %6, %19,  %3\n\t"
+                    "v_dot2_f32_f16 %0, %7, %20,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %7, %21,  %1\n\t"
+                    "v_dot2_f32_f16 %2, %7, %22,  %2\n\t"
+                    "v_dot2_f32_f16 %3, %7, %23,  %3\n\t"
+                    : "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3)
+                    : "v"(k0), "v"(k1), "v"(k2), "v"(k3),
+                      "v"(q0_0), "v"(q1_0), "v"(q2_0), "v"(q3_0),
+                      "v"(q0_1), "v"(q1_1), "v"(q2_1), "v"(q3_1),
+                      "v"(q0_2), "v"(q1_2), "v"(q2_2), "v"(q3_2),
+                      "v"(q0_3), "v"(q1_3), "v"(q2_3), "v"(q3_3)
+                );
+            }
+        } else if constexpr (cpw == 2 && cpy_ne == 4) {
 #pragma unroll
-            for (int jc0 = 0; jc0 < cpw; ++jc0) {
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+                const int row = i_KQ_0 / (np*warp_size);
+                float & a0 = KQ_acc[row*2 + 0];
+                float & a1 = KQ_acc[row*2 + 1];
+
+                const half2 k0 = K_k[row][0];
+                const half2 k1 = K_k[row][1];
+                const half2 k2 = K_k[row][2];
+                const half2 k3 = K_k[row][3];
+
+                const half2 q0_0 = Q_k[0][0]; const half2 q1_0 = Q_k[1][0];
+                const half2 q0_1 = Q_k[0][1]; const half2 q1_1 = Q_k[1][1];
+                const half2 q0_2 = Q_k[0][2]; const half2 q1_2 = Q_k[1][2];
+                const half2 q0_3 = Q_k[0][3]; const half2 q1_3 = Q_k[1][3];
+
+                asm volatile(
+                    "v_dot2_f32_f16 %0, %2,  %6,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %2,  %7,  %1\n\t"
+                    "v_dot2_f32_f16 %0, %3,  %8,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %3,  %9,  %1\n\t"
+                    "v_dot2_f32_f16 %0, %4, %10,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %4, %11,  %1\n\t"
+                    "v_dot2_f32_f16 %0, %5, %12,  %0\n\t"
+                    "v_dot2_f32_f16 %1, %5, %13,  %1\n\t"
+                    : "+v"(a0), "+v"(a1)
+                    : "v"(k0), "v"(k1), "v"(k2), "v"(k3),
+                      "v"(q0_0), "v"(q1_0),
+                      "v"(q0_1), "v"(q1_1),
+                      "v"(q0_2), "v"(q1_2),
+                      "v"(q0_3), "v"(q1_3)
+                );
+            }
+        } else
+#endif // defined(__HIP_DEVICE_COMPILE__)
+        {
 #pragma unroll
-                for (int k = 0; k < cpy_ne; ++k) {
-                    ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
+            for (int k = 0; k < cpy_ne; ++k) {
+#pragma unroll
+                for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+#pragma unroll
+                    for (int jc0 = 0; jc0 < cpw; ++jc0) {
+                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
+                    }
                 }
             }
         }
@@ -808,6 +895,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 }
             }
 
+#if defined(__HIP_DEVICE_COMPILE__)
+            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#endif
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
@@ -879,7 +969,7 @@ static __global__ void flash_attn_tile(
     // Skip unused kernel variants for faster compilation:
 
     if (
-#ifdef GGML_USE_WMMA_FATTN
+#if defined(GGML_USE_WMMA_FATTN) && !defined(GGML_USE_HIP)
             (ncols2 != 1 && DV != 40 && DV != 72 && DV != 512) ||
 #endif // GGML_USE_WMMA_FATTN
             (use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))
@@ -1443,6 +1533,10 @@ static bool launch_fattn_tile_q4_0_gfx1151(ggml_backend_cuda_context & ctx, ggml
 
 template <int DKQ, int DV>
 void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (launch_fattn_wmma_gfx1151<DKQ, DV>(ctx, dst)) {
+        return;
+    }
+
     const ggml_tensor * KQV = dst;
 
     float logit_softcap;

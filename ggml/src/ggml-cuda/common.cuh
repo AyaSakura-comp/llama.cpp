@@ -1480,6 +1480,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    const void * src1_q8_1_pre = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
