@@ -10647,6 +10647,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 0 && "fused gated_delta_net_conv has no CPU implementation");
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

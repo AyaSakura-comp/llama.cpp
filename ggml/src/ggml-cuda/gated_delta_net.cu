@@ -1,4 +1,8 @@
+#include <string>
+#include <vector>
+#include <cstdio>
 #include "gated_delta_net.cuh"
+#include "gdn-fused.cuh"
 
 template <int S_v, bool KDA, int num_warps = 4>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * num_warps, 2)
@@ -211,7 +215,54 @@ static void launch_gated_delta_net(
     }
 }
 
+// fused conv1d + SiLU + l2norm(q,k) + GDN (ggml_gated_delta_net_conv), gfx11 wave32 only
+static void ggml_cuda_op_gated_delta_net_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * cs = dst->src[1];
+    const ggml_tensor * cw = dst->src[2];
+    const ggml_tensor * g  = dst->src[3];
+    const ggml_tensor * b  = dst->src[4];
+    const ggml_tensor * st = dst->src[5];
+    GGML_ASSERT(st->ne[0] == gdnf::D && st->ne[2] == gdnf::HV && x->ne[0] == gdnf::CH && cw->ne[0] == gdnf::KW);
+    const float eps = ggml_get_op_params_f32(dst, 1);
+    const int T = (int) x->ne[1], n_seqs = (int) x->ne[2];
+    // debug: GDN_FUSED_DUMP=<dir> dumps the first call's inputs (raw fp32) + a meta line
+    static int dumped = 0, ncall = 0;
+    const int want = getenv("GDN_FUSED_DUMP_CALL") ? atoi(getenv("GDN_FUSED_DUMP_CALL")) : 0;
+    if (T >= 64 && ncall++ == want && getenv("GDN_FUSED_DUMP") && !dumped) {
+        dumped = 1;
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        const std::string d = getenv("GDN_FUSED_DUMP");
+        auto dump = [&](const ggml_tensor * t, const char * name) {
+            std::vector<char> h(ggml_nbytes(t));
+            CUDA_CHECK(cudaMemcpy(h.data(), t->data, h.size(), cudaMemcpyDeviceToHost));
+            FILE * f = fopen((d + "/" + name + ".bin").c_str(), "wb"); fwrite(h.data(), 1, h.size(), f); fclose(f);
+        };
+        dump(x, "x"); dump(cs, "cstate"); dump(cw, "cw"); dump(g, "g"); dump(b, "beta"); dump(st, "state");
+        FILE * f = fopen((d + "/meta.txt").c_str(), "w");
+        fprintf(f, "T=%d n_seqs=%d eps=%g x_ne=%lld,%lld,%lld x_nb=%zu,%zu,%zu cs_ne=%lld,%lld,%lld cw_ne=%lld,%lld g_ne=%lld,%lld,%lld,%lld st_ne=%lld,%lld,%lld,%lld\n",
+            T, n_seqs, eps, (long long) x->ne[0], (long long) x->ne[1], (long long) x->ne[2], x->nb[0], x->nb[1], x->nb[2],
+            (long long) cs->ne[0], (long long) cs->ne[1], (long long) cs->ne[2], (long long) cw->ne[0], (long long) cw->ne[1],
+            (long long) g->ne[0], (long long) g->ne[1], (long long) g->ne[2], (long long) g->ne[3],
+            (long long) st->ne[0], (long long) st->ne[1], (long long) st->ne[2], (long long) st->ne[3]);
+        fclose(f);
+    }
+    gdnf::launch_ws<8>((const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float),
+        (const float *) cs->data, (const float *) cw->data, (const float *) g->data, (const float *) b->data,
+        (const float *) st->data, (float *) dst->data, T, n_seqs, eps, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("gated_delta_net_conv: HIP only");
+#endif
+}
+
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == 1) {
+        ggml_cuda_op_gated_delta_net_conv(ctx, dst);
+        return;
+    }
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];

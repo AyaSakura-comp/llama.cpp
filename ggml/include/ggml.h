@@ -2563,6 +2563,23 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // Fused causal-conv1d + SiLU + l2norm(q,k) + gated delta net (prefill), CUDA/HIP only.
+    //   x      : qkv_mixed [ (2*HK + HV)*S, n_tokens, n_seqs ]   (q | k | v channels, pre-conv)
+    //   cstate : conv state [ KW-1, channels, n_seqs ]
+    //   cw     : conv weight [ KW, channels ]
+    //   g, beta: [1, HV, n_tokens, n_seqs];  state: [S, S, HV, n_seqs]
+    // Result layout is identical to ggml_gated_delta_net (attn | new_state).
+    // Marked with op_params[0] = 1 on GGML_OP_GATED_DELTA_NET; op_params[1] = eps (l2norm).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * cstate,
+            struct ggml_tensor  * cw,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            float                 eps);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
