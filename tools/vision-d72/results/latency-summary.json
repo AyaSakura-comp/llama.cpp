@@ -1,0 +1,19 @@
+{
+  "generic": {
+    "runs_ms": [
+      6176.38,
+      6200.86,
+      6228.3
+    ],
+    "median_ms": 6200.86
+  },
+  "intrinsic": {
+    "runs_ms": [
+      4628.0,
+      4649.41,
+      4652.34
+    ],
+    "median_ms": 4649.41
+  },
+  "encoder_reduction_percent": 25.01991659221463
+}

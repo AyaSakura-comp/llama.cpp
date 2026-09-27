@@ -1,0 +1,12 @@
+{
+  "plain": {
+    "SQ_INSTS_LDS": 77186594.0,
+    "SQ_INSTS_SALU": 39247872.0,
+    "SQ_INSTS_VALU": 183530496.0
+  },
+  "prefetch": {
+    "SQ_INSTS_LDS": 74331914.0,
+    "SQ_INSTS_SALU": 33503232.0,
+    "SQ_INSTS_VALU": 215973888.0
+  }
+}
