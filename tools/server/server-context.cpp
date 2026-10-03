@@ -2884,18 +2884,21 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL || p0 == 0) {
-                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
-                            SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+                    // Always truncate, including hybrid/recurrent (FULL) contexts: after a checkpoint
+                    // restore only the recurrent part is rewound; the attention KV cells at
+                    // positions >= p0 still hold the previous prompt. Skipping this made new
+                    // tokens coexist with stale cells at the same positions, leaking earlier
+                    // conversations into later ones (regression from c529d79d4).
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
-                            slot.prompt_clear(true);
+                        slot.prompt_clear(true);
 
-                            // there is no common part left
-                            slot.n_prompt_tokens_cache = 0;
-                        } else {
-                            if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
-                                GGML_ABORT("failed to truncate draft context\n");
-                            }
+                        // there is no common part left
+                        slot.n_prompt_tokens_cache = 0;
+                    } else {
+                        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
+                            GGML_ABORT("failed to truncate draft context\n");
                         }
                     }
 
