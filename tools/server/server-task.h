@@ -135,6 +135,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+    std::string slot_owner; // snapshot file the request's context belongs to ("slot_snapshot")
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
