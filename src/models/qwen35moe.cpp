@@ -526,67 +526,93 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    // Experimental fused prefill path (LLAMA_GDN_FUSED=1): one kernel does causal conv1d + SiLU +
+    // l2norm(q,k) + gated delta rule, reading the raw qkv projection and the conv state directly.
+    // It must run before conv_state_update overwrites the conv state, hence the explicit expand order.
+    static const bool gdn_fused_env = getenv("LLAMA_GDN_FUSED") != nullptr && atoi(getenv("LLAMA_GDN_FUSED")) == 1;
+    const bool use_gdn_fused = gdn_fused_env && n_seq_tokens >= 16 &&
+        head_k_dim == 128 && head_v_dim == 128 && num_k_heads == 16 && num_v_heads == 32 && conv_kernel_size == 4;
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
+    std::pair<ggml_tensor *, ggml_tensor *> attn_out;
+    if (use_gdn_fused) {
+        ggml_tensor * x_raw = ggml_reshape_3d(ctx0, qkv_mixed_untransposed, conv_channels, n_seq_tokens, n_seqs);
+        ggml_tensor * res = ggml_gated_delta_net_conv(ctx0, x_raw, conv_states, conv_kernel, gate, beta, state,
+                                                      hparams.f_norm_rms_eps);
+        cb(res, LLAMA_TENSOR_NAME_FGDN_CH, il);
+        ggml_build_forward_expand(gf, res);
+        ggml_build_forward_expand(gf, conv_state_update);
+        const int64_t S_v = head_v_dim, H_v = num_v_heads;
+        ggml_tensor * output = ggml_view_4d(ctx0, res, S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(res->type, S_v), ggml_row_size(res->type, S_v * H_v),
+                ggml_row_size(res->type, S_v * H_v * n_seq_tokens), 0);
+        ggml_tensor * new_st = ggml_view_4d(ctx0, res, S_v, S_v, H_v, n_seqs,
+                ggml_row_size(res->type, S_v), ggml_row_size(res->type, S_v * S_v),
+                ggml_row_size(res->type, S_v * S_v * H_v),
+                ggml_row_size(res->type, S_v * H_v * n_seq_tokens * n_seqs));
+        attn_out = {output, new_st};
+    } else {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
 
-    // Keep CONCAT -> SSM_CONV -> SILU adjacent for CUDA fusion, then persist the recurrent state.
-    ggml_build_forward_expand(gf, conv_output_silu);
-    ggml_build_forward_expand(gf, conv_state_update);
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
 
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
+        // Keep CONCAT -> SSM_CONV -> SILU adjacent for CUDA fusion, then persist the recurrent state.
+        ggml_build_forward_expand(gf, conv_output_silu);
+        ggml_build_forward_expand(gf, conv_state_update);
 
-    // Calculate the total conv dimension
-    int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
 
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
+        // Calculate the total conv dimension
+        int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
 
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+        // Extract the convolved Q, K, V from conv_output
+        ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                0);
 
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+        ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
 
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
+        ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
-    const float eps_norm = hparams.f_norm_rms_eps;
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        const float eps_norm = hparams.f_norm_rms_eps;
 
-    //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
 
-    // if head keys and value keys are different, repeat to force tensors into matching shapes
-    // note: need explicit repeat only if we are not using the fused GDN
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
-        GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+
+        // if head keys and value keys are different, repeat to force tensors into matching shapes
+        // note: need explicit repeat only if we are not using the fused GDN
+        if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+            GGML_ASSERT(num_v_heads % num_k_heads == 0);
+            q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+            k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        }
+
+        cb(q_conv, "q_conv_predelta", il);
+        cb(k_conv, "k_conv_predelta", il);
+        cb(v_conv, "v_conv_predelta", il);
+
+        attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
     }
-
-    cb(q_conv, "q_conv_predelta", il);
-    cb(k_conv, "k_conv_predelta", il);
-    cb(v_conv, "v_conv_predelta", il);
-
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;

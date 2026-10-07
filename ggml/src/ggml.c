@@ -6204,6 +6204,47 @@ struct ggml_tensor * ggml_solve_tri(
     return result;
 }
 
+// ggml_gated_delta_net_conv (fused conv1d+SiLU+l2norm+GDN, CUDA/HIP only)
+
+struct ggml_tensor * ggml_gated_delta_net_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * cstate,
+        struct ggml_tensor  * cw,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && cstate->type == GGML_TYPE_F32 && cw->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(x));
+    GGML_ASSERT(ggml_is_contiguous(cstate) && ggml_is_contiguous(cw) && ggml_is_contiguous(g) && ggml_is_contiguous(beta) && ggml_is_contiguous(state));
+    const int64_t S_v      = state->ne[0];
+    const int64_t H        = state->ne[2];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_seqs   = x->ne[2];
+    GGML_ASSERT(state->ne[1] == S_v && state->ne[3] == n_seqs);
+    GGML_ASSERT(cw->ne[1] == x->ne[0] && cstate->ne[0] == cw->ne[0] - 1 && cstate->ne[1] == x->ne[0] && cstate->ne[2] == n_seqs);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = x;
+    result->src[1] = cstate;
+    result->src[2] = cw;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+
+    return result;
+}
+
 // ggml_gated_delta_net
 
 struct ggml_tensor * ggml_gated_delta_net(

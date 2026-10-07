@@ -3,6 +3,14 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+static int get_moe_ncols_max(int64_t ne12) {
+    static const int moe_ncols_cap = []() {
+        const char * s = std::getenv("GGML_CUDA_MOE_MMQ_NCOLS_MAX");
+        return s ? std::atoi(s) : 512;
+    }();
+    return moe_ncols_cap > 0 ? std::min<int>(ne12, moe_ncols_cap) : int(ne12);
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -75,7 +83,8 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -125,11 +134,19 @@ void ggml_cuda_mul_mat_q(
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-            get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const void * src1_q8_1_ptr = nullptr;
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
 
-        {
+        if (fusion && fusion->src1_q8_1_pre) {
+            // Caller (fused RMS_NORM+MUL+quantize path) has already populated the Q8_1 scratch.
+            // Skip allocation and quantize; use_native_fp4 is not supported in this fast path.
+            GGML_ASSERT(!use_native_fp4);
+            src1_q8_1_ptr = fusion->src1_q8_1_pre;
+        } else {
+            const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+                get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -137,12 +154,12 @@ void ggml_cuda_mul_mat_q(
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+            src1_q8_1_ptr = src1_q8_1.get();
         }
 
         // Stride depends on quantization format
@@ -152,7 +169,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -183,15 +200,22 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    const void * src1_q8_1_ptr_ids = nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
 
     const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
-    {
+    if (fusion && fusion->src1_q8_1_pre) {
+        // Caller (fused RMS_NORM+MUL+quantize path) produced the routed Q8_1 scratch already.
+        GGML_ASSERT(!use_native_fp4);
+        src1_q8_1_ptr_ids = fusion->src1_q8_1_pre;
+    } else {
+        const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+            get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+        src1_q8_1.alloc(nbytes_src1_q8_1);
+
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -204,6 +228,7 @@ void ggml_cuda_mul_mat_q(
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
+        src1_q8_1_ptr_ids = src1_q8_1.get();
     }
 
     static_assert(QK_K == 8 * QK_MXFP4, "QK_K needs to be 8 * QK_MXFP4");
@@ -213,11 +238,11 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1_ptr_ids, ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, get_moe_ncols_max(ne12)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -243,8 +268,6 @@ void ggml_cuda_mul_mat_q_moe_pair(
 
     cudaStream_t stream = ctx.stream();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                           || GGML_CUDA_CC_IS_CDNA(cc);
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
@@ -252,19 +275,20 @@ void ggml_cuda_mul_mat_q_moe_pair(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
+    const int64_t n_experts = src0_up->ne[2];
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0_up->ne[2] + 1);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_experts + 1);
 
-    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int si1 = ids->nb[1] / ggml_element_size(ids);
     const int sis1 = src1->nb[2] / src1->nb[1];
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        src0_up->ne[2], ne12, n_expert_used, ne11, si1, sis1, stream);
+                                   n_experts, ne12, n_expert_used, ne11, si1, sis1, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
+        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
     const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
@@ -278,6 +302,9 @@ void ggml_cuda_mul_mat_q_moe_pair(
     const int64_t stride_y_channel = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t stride_y_sample  = ne12 * stride_y_channel;
 
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                            || GGML_CUDA_CC_IS_CDNA(cc);
+
     const auto launch = [&](const ggml_tensor * src0, ggml_tensor * dst) {
         const int64_t ts_src0 = ggml_type_size(src0->type);
         const int64_t ts_dst  = ggml_type_size(dst->type);
@@ -287,7 +314,7 @@ void ggml_cuda_mul_mat_q_moe_pair(
             src0->ne[0], src0->ne[1], ne_get_rows, int64_t(src0->nb[1]) / ts_src0, ne_get_rows, int64_t(dst->nb[1]) / ts_dst,
             src0->ne[2], src0->ne[2], int64_t(src0->nb[2]) / ts_src0, stride_y_channel, int64_t(dst->nb[2]) / ts_dst,
             src0->ne[3], src1->ne[3], int64_t(src0->nb[3]) / ts_src0, stride_y_sample, int64_t(dst->nb[3]) / ts_dst,
-            use_stream_k, ne12};
+            use_stream_k, get_moe_ncols_max(ne12)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     };
 
@@ -357,7 +384,7 @@ void ggml_cuda_mul_mat_q_moe_swiglu_down(
             src0->ne[0], src0->ne[1], ne_get_rows, int64_t(src0->nb[1])/ts0, ne_get_rows, int64_t(dst->nb[1]/sizeof(float)),
             src0->ne[2], src0->ne[2], int64_t(src0->nb[2])/ts0, input_stride_y, int64_t(dst->nb[2]/sizeof(float)),
             src0->ne[3], src1->ne[3], int64_t(src0->nb[3])/ts0, input_stride_sample, int64_t(dst->nb[3]/sizeof(float)),
-            false, ne12};
+            false, get_moe_ncols_max(ne12)};
     };
 
     const int64_t ne_swiglu = src0_up->ne[1];
@@ -385,7 +412,7 @@ void ggml_cuda_mul_mat_q_moe_swiglu_down(
         down_stride_y, int64_t(dst_final->nb[2]/sizeof(float)),
         src0_down->ne[3], 1, int64_t(src0_down->nb[3])/ts_down,
         down_stride_y, int64_t(dst_final->nb[3]/sizeof(float)),
-        false, ne12};
+        false, get_moe_ncols_max(ne12)};
     down_args.output_weights = fuse_output_weight ? (const float *) weights->data : nullptr;
     ggml_cuda_mul_mat_q_switch_type(ctx, down_args, stream);
     GGML_UNUSED(dst_up);

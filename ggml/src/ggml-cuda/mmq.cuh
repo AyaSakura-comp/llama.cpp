@@ -3784,65 +3784,71 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
-        const int jt = weight_stationary ? blockIdx.x : blockIdx.y;
-        const int it = weight_stationary ? blockIdx.y : blockIdx.x;
+        const int jt_base  = weight_stationary ? blockIdx.x : blockIdx.y;
+        const int it       = weight_stationary ? blockIdx.y : blockIdx.x;
+        const int ntx_grid = weight_stationary ? gridDim.x  : gridDim.y;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
-        int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst;
 
         if (ids_dst) {
             col_low  = expert_bounds[zt + 0];
             col_high = expert_bounds[zt + 1];
             col_diff = col_high - col_low;
-
-            offset_y   = 0;
-            offset_dst = 0;
-
-            if (jt*mmq_x >= col_diff) {
-                return;
-            }
-
-            // __syncthreads(); // There is no previous tile that could cause a race condition.
-#pragma unroll
-            for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-
-                if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
-                    break;
-                }
-
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
-            }
-            __syncthreads();
         }
 
-        offset_y   += (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
-        offset_dst += it*mmq_y;
-
-        const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
-        const int tile_y_max_j = col_diff - jt*mmq_x - 1;
-
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
 
-        constexpr bool fixup = false;
-        if constexpr (fuse_swiglu_q8_1) {
-            mul_mat_q_process_tile<type, mmq_x, need_check, fixup, true>
-                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
-                 stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
-                 x_gate, dst_swiglu_q8_1, shared_gate_offset, q8_ncols, it*mmq_y, col_low + jt*mmq_x);
-        } else if constexpr (fuse_output_weight) {
-            mul_mat_q_process_tile<type, mmq_x, need_check, fixup, false, true>
-                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
-                 nullptr, nullptr, 0, 0, 0, 0, output_weights);
-        } else {
-            mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        for (int jt = jt_base; jt*mmq_x < col_diff; jt += ntx_grid) {
+            int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
+            int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst;
+
+            if (ids_dst) {
+                offset_y   = 0;
+                offset_dst = 0;
+
+#pragma unroll
+                for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                        break;
+                    }
+
+                    ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                }
+                __syncthreads();
+            }
+
+            offset_y   += (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
+            offset_dst += it*mmq_y;
+
+            const int tile_y_max_j = col_diff - jt*mmq_x - 1;
+
+            constexpr bool fixup = false;
+            if constexpr (fuse_swiglu_q8_1) {
+                mul_mat_q_process_tile<type, mmq_x, need_check, fixup, true>
+                    (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+                     stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+                     x_gate, dst_swiglu_q8_1, shared_gate_offset, q8_ncols, it*mmq_y, col_low + jt*mmq_x);
+            } else if constexpr (fuse_output_weight) {
+                mul_mat_q_process_tile<type, mmq_x, need_check, fixup, false, true>
+                    (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+                     tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+                     nullptr, nullptr, 0, 0, 0, 0, output_weights);
+            } else {
+                mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+                    (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+                     tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+            }
+            __syncthreads();
+
+            if (!ids_dst) {
+                break;
+            }
         }
         return;
     }
@@ -4469,7 +4475,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
 void ggml_cuda_mul_mat_q_moe_pair(
         ggml_backend_cuda_context & ctx,

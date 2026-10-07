@@ -373,6 +373,38 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     const int     iqs   =  i0          % (QK4_0/2);
     const int     shift = (i0 % QK4_0) / (QK4_0/2);
 
+#if defined(GGML_USE_HIP) && defined(RDNA3)
+    int q;
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    const int qs = (q >> (4*shift)) ^ 0x88888888u;
+    const int n0 = __builtin_amdgcn_sbfe(qs, 0, 4);
+    const int n1 = __builtin_amdgcn_sbfe(qs, 8, 4);
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+        ((half2 *) dst)[0] = d * make_half2(n0, n1);
+        if constexpr (ne == 4) {
+            const int n2 = __builtin_amdgcn_sbfe(qs, 16, 4);
+            const int n3 = __builtin_amdgcn_sbfe(qs, 24, 4);
+            ((half2 *) dst)[1] = d * make_half2(n2, n3);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+        ((float *) dst)[0] = d * n0;
+        ((float *) dst)[1] = d * n1;
+        if constexpr (ne == 4) {
+            const int n2 = __builtin_amdgcn_sbfe(qs, 16, 4);
+            const int n3 = __builtin_amdgcn_sbfe(qs, 24, 4);
+            ((float *) dst)[2] = d * n2;
+            ((float *) dst)[3] = d * n3;
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+#else
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
@@ -402,6 +434,7 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     } else {
         static_assert(std::is_same_v<T, void>, "bad type");
     }
+#endif // defined(GGML_USE_HIP) && defined(RDNA3)
 }
 
 template <typename T, int ne>
@@ -642,7 +675,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
         int all_inf = 1;
 
-#pragma unroll
+#pragma unroll 4
         for (int j = 0; j < ncols1; ++j) {
             const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
@@ -1029,6 +1062,9 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
@@ -1125,11 +1161,9 @@ void launch_fattn(
     }
 
     float scale         = 1.0f;
-    float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
 
     memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
-    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     if (logit_softcap != 0.0f) {
