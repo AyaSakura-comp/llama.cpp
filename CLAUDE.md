@@ -31,39 +31,46 @@ This work optimizes Qwen 3.6 35B-A3B on an AMD Strix Halo APU:
 | ROCm | 7.2.2 |
 | Source | `/home/chihmin/llama-mtp-opt` |
 | Active branch at this snapshot | `flashhead-lm-head` |
-| Active committed HEAD | `15bd9b002877` |
+| Active committed HEAD | merge of `perf/gfx1151-wmma-fa` (2026-10-08) |
 | Branch baseline | `a421d661a` (`mtp-clean`) |
 | Production service | `qwen-mtp.service`, port 8001 |
 | Model alias | `qwen3.6-35b-q4` |
-| Context / slots | `-c 260000 -np 1` (API reports 260096) |
+| Context / slots | `-c 520000 -np 2` (260096 per slot) |
 | Batch | `-b 4096 -ub 2048` |
 | Speculation | `--spec-type mtp --spec-draft-n-max 3` |
-| Production policy | FlashHead draft, **dense target verifier**, F16 target/draft KV |
+| Production policy | FlashHead draft, **dense target verifier**, F16 target/draft KV, fused GDN prefill, WMMA FA prefill |
 
-The worktree is intentionally dirty at this snapshot. The uncommitted Dynamic-PP
-change is described in its own section. Do not lose it during rebases or branch
-switches.
+The former uncommitted research working tree (MMQ/MMVQ, fattn-tile, hadamard,
+mul_mat_small_m, WMMA intrinsic tests) is committed as `1ed544f6f` and merged with
+the fused GDN and WMMA FA work. The worktree is clean apart from profiler output.
 
 ### Current production artifact
 
 ```text
-/home/chihmin/llama-mtp-deploy/
-  gfx1151-dynamic-mtp-pp-15bd9b0028-120407c7b2/bin/llama-server
+/home/chihmin/llama-mtp-deploy/gfx1151-gdnfused-wmmafa-20261007/bin/llama-server
 ```
 
-This artifact was built from base commit `15bd9b0028` plus Dynamic-PP patch hash
-`120407c7b2`. It is immutable but should eventually be replaced by a deployment
-built from the formal Dynamic-PP commit.
+Deployed 2026-10-07. Same source as this branch: the 2026-09-26 GDN-fused deploy
+plus the three server fixes, with `libggml-hip` rebuilt to include the WMMA FA
+kernel. RUNPATH `$ORIGIN:/opt/rocm-7.2.2/lib`.
 
-Production currently uses:
+Production currently uses (`/etc/systemd/system/qwen-mtp.service.d/zzz-np2.conf`,
+which overrides `zz-flashhead.conf`):
 
 ```text
 GGUF=/home/chihmin/models/Qwen3.6-35B-A3B-selective-Q4_0-proof/
      Qwen3.6-35B-A3B-UD-Q4_K_M-selective-Q4_0-flashhead.gguf
 LLAMA_FLASHHEAD_PROBES=256
 LLAMA_FLASHHEAD_TARGET is absent
-KV cache: F16 target + F16 draft
+LLAMA_GDN_FUSED=1
+GGML_CUDA_GFX1151_WMMA_FA=1
+GGML_CUDA_EXPERIMENTAL_GFX1151_Q4_KV_TILED=1 (inactive while KV is F16)
+KV cache: F16 target + F16 draft (Q4_0 KV until 2026-10-08)
+-c 520000 -np 2 -b 4096 -ub 2048 --slot-save-path /home/chihmin/.cache/llama-slots/
 ```
+
+Rollbacks: `zzz-np2.conf.bak-20261007-q4kv` (Q4_0 KV, WMMA FA on),
+`zzz-np2.conf.bak-20261007-pre-wmmafa` (previous `gfx1151-gdnfused-503855413-20260926`).
 
 `LLAMA_FLASHHEAD_TARGET=1` enables the approximate All-FlashHead experiment. It
 must remain absent in default production.
@@ -230,6 +237,38 @@ what they do; the complete chronological ledger follows.
 - **Multimodal metadata lifecycle**: In `tools/server/server-context.cpp`, saving text-only slots now removes stale `.media.json` sidecars, preventing obsolete image metadata from corrupting subsequent restores.
 - **Safe position bounds and checkpoint restoration**: In `tools/server/server-common.cpp` and `server-context.cpp`, out-of-bounds media entries (`idx >= tokens.size()`) are ignored, `pos_next()` is clamped to non-negative, and restored checkpoint `pos_max` is bounded by `llama_memory_seq_pos_max()` to prevent M-RoPE position divergence (`X < Y`).
 
+### 11. Fused GDN prefill (`eee6d3ad6`)
+
+- Fused causal-conv1d + SiLU + l2norm(q,k) + gated delta net prefill kernel for
+  gfx1151, exposed as `ggml_gated_delta_net_conv` and enabled with
+  `LLAMA_GDN_FUSED=1`.
+- Prefill at 20K: 1132 → 1586 tok/s versus the previous deployment.
+
+### 12. gfx11 WMMA flash attention for long-context prefill (`1c5de85e1`)
+
+- Profiling of 120K-depth prefill showed `flash_attn_tile<256,256,4,8>` at 89% of GPU
+  time, LDS-latency bound (6.4 TFLOPS). Upstream's 64-row WMMA kernel is DRAM bound
+  on this shape (72% vmcnt stall, 314 GB/s from L2).
+- New kernel `ggml/src/ggml-cuda/fattn-gfx1151.cu`: 128 query rows per workgroup
+  (16 tokens × 8 GQA heads), 16 waves; transposed S^T = K·Q^T and O^T = V^T·P^T so
+  each lane owns one query row (lane-local softmax plus a permlanex16 swap); Q for
+  all 256 dims in VGPRs; BN=16 KV tiles double-buffered in LDS with one barrier per
+  tile; DPP instead of ds_bpermute.
+- Opt-in via `GGML_CUDA_GFX1151_WMMA_FA=1`. Eligibility: RDNA3, D=256, GQA 8,
+  ≥64 query tokens, F32 Q, F16 mask, no sinks/ALiBi/softcap, 16-aligned strides.
+  Quantized K/V are converted to F16 as in `launch_fattn`. Decode and MTP draft
+  (≤4 tokens) and every ineligible op use the unchanged kernel selection.
+- Op level, 131K depth, 2048 tokens, Q4_0 KV: 683 → 213 ms (20.8 TFLOPS). Cosine
+  versus FP64 reference: tile 0.99872, new kernel 0.9999999.
+- End to end, cold interleaved A1 B1 B2 A2, prefill per 20K append: 1586 → 1807 at
+  0K, 727 → 1047 at 40K, 389 → 738 at 80K, 243 → 554 at 121K (2.27×).
+- **Not bit-exact.** 41.5K-token prompt, 6 greedy steps, full 248,320 logprobs:
+  sampled tokens identical, minimum logprob cosine 0.99994, median TV 0.64%, max TV
+  2.16%. The user explicitly approved deploying this numeric change on 2026-10-07;
+  the bit-exact requirement in the correctness invariants still applies to every
+  other change. Extracted-kernel harness and evidence: `~/src/fa-extract/`.
+- Decode is unaffected (20K/1024 with the calibrated prompt: 71.6–71.9 tok/s).
+
 ## Active-branch commit ledger
 
 | Commit | Change |
@@ -269,6 +308,18 @@ what they do; the complete chronological ledger follows.
 | `b46e3e8d4` | `[verified] disable MTP for multimodal requests` |
 | `63584e4de` | `[verified] resume bounded MTP after media` |
 | `15bd9b002` | `[verified] enable full MTP depth after media` |
+| `d409dd195` | `perf(mtp): dynamic prompt-processing compute reserve for MTP` |
+| `24e5e89f9` | `feat(server): expose slot snapshot_filename and t_last_used in /slots` |
+| `c529d79d4` | `feat(server): dual-track MTP draft KV snapshot persistence` |
+| `503855413` | `fix(server): patch Qwen preserve_thinking empty reasoning template` |
+| `1ac2c26d2` | `fix(server): persist slot context checkpoints` |
+| `ad5a834f5` | `fix(server): always truncate target memory after checkpoint restore` |
+| `16f213bba` | `feat(server): save a slot's unsaved context before another context evicts it` |
+| `1ed544f6f` | snapshot: research working tree used for the 2026-09-26 deploy |
+| `eee6d3ad6` | hip: fused conv+l2norm+gated-delta-net prefill kernel (`LLAMA_GDN_FUSED=1`) |
+| `31150e726` `82f7d6532` `0d81e3c3f` | cherry-picks of `1ac2c26d2` `ad5a834f5` `16f213bba` onto `perf/gfx1151-wmma-fa` |
+| `1c5de85e1` | hip: gfx11 WMMA flash attention for long-context prefill |
+| `a851bd230` | merge `perf/gfx1151-wmma-fa` |
 
 ## Uncommitted change: Dynamic MTP prompt-processing reserve
 
@@ -541,6 +592,12 @@ $HELPER draft-flashhead  # production: FlashHead draft, dense target
 $HELPER flashhead        # experimental: FlashHead draft + approximate target
 $HELPER f16-baseline     # dense draft and target heads, F16 KV
 ```
+
+**2026-10-08 note:** the helper script is no longer on disk, and the effective
+drop-in is `zzz-np2.conf` (it sorts after `zz-flashhead.conf` and overrides it).
+Until the helper is restored: back up `zzz-np2.conf`, edit it, then
+`sudo systemctl daemon-reload && sudo systemctl restart qwen-mtp.service`, and run
+the mandatory checks below.
 
 The helper manages:
 
