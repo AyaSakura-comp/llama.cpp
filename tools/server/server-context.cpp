@@ -2080,6 +2080,10 @@ private:
                         slot_flush_owner(*slot, task.slot_owner);
                         slot->owner_snapshot = task.slot_owner;
                         slot->owner_dirty    = !task.slot_owner.empty();
+                        // snapshot_filename names whose context the slot holds. An owned request
+                        // claims it (golden restore -> session); an unowned one (side planner
+                        // calls) overwrites it, so clients must not treat the slot as theirs.
+                        slot->snapshot_filename = task.slot_owner;
                     }
 
                     if (task.is_parent()) {
